@@ -83,7 +83,6 @@ def score_coin(ticker, btc_change):
 
     if not symbol.endswith("USDT"):
         return None
-    
     if symbol in ["BTCUSDT", "ETHUSDT", "BNBUSDT"]:
     return None
 
