@@ -32,6 +32,16 @@ from trader import (
     format_analysis_report,
 )
 from learner import build_nightly_report, market_intel
+from ai_brain import (
+    ask_ai,
+    ai_coin_comment,
+    btc_tracker,
+    circuit_breaker,
+    detect_flash_crash,
+    compute_portfolio_drawdown,
+    volatility_position_multiplier,
+    compute_atr_ratio,
+)
 
 load_dotenv()
 
@@ -615,6 +625,19 @@ def analyze_single_coin(symbol: str, client: Client) -> None:
         if tutar_str:
             lines.append(tutar_str)
 
+        # Groq AI kısa yorum
+        trending_list = getattr(market_intel, "trending", [])
+        ai_comment = ai_coin_comment(
+            symbol=symbol,
+            score=score,
+            price_change=coin.get("change", 0),
+            trend="yukarı" if ema_bull else "aşağı",
+            rsi=rsi,
+            is_trending=symbol in trending_list,
+        )
+        if ai_comment:
+            lines += ["", f"💬 AI Yorum: {ai_comment}"]
+
         send_telegram("\n".join(lines))
 
     except Exception as exc:
@@ -697,7 +720,21 @@ def handle_free_text(text: str, client: Client) -> None:
             send_telegram("📭 Henüz kayıtlı işlem yok.")
         return
 
-    # Bilinmeyen mesaj
+    # Groq AI ile genel sorular — keyword'e takılmadan anlar
+    ai_context = ""
+    if not market_intel.is_stale():
+        ai_context = market_intel.summary_text()
+    fg = getattr(market_intel, "fear_greed", None)
+    if fg:
+        ai_context += f"\nFear&Greed: {fg['value']}/100"
+    ai_context += f"\nDevre kesici: {circuit_breaker.state} ({circuit_breaker.reason})"
+
+    ai_reply = ask_ai(text, ai_context)
+    if ai_reply:
+        send_telegram(f"🤖 {ai_reply}")
+        return
+
+    # AI yoksa (GROQ_API_KEY boş) eski keyword sistemi
     send_telegram(
         "🤔 Anlayamadım. Şöyle yazabilirsin:\n\n"
         "• *SOL nasıl?* — coin analizi\n"
@@ -724,7 +761,7 @@ COMMANDS_HELP = """📋 Kullanılabilir komutlar:
 💡 Seans başlatmak için:
    *90 usdt 21:00*  yaz → 21:00'a kadar 90 USDT ile işlem yapar"""
 
-_bot_state: dict = {"last_scan": None, "scan_count": 0}
+_bot_state: dict = {"last_scan": None, "scan_count": 0, "last_cb_state": "NORMAL"}
 
 
 def start_command_listener(client: Client) -> None:
@@ -798,17 +835,28 @@ def start_command_listener(client: Client) -> None:
             )
             auto_str = "✅ AÇIK" if AUTO_TRADE_ENABLED else "❌ KAPALI (sinyal modu)"
 
+            cb_emoji = circuit_breaker.status_emoji()
+            cb_str   = f"{cb_emoji} {circuit_breaker.state}"
+            if circuit_breaker.reason:
+                cb_str += f" — {circuit_breaker.reason}"
+            btc_15m  = btc_tracker.change_in_minutes(15)
+            btc_15m_str = f"{btc_15m:+.2f}%" if btc_15m is not None else "veri yok"
+
             lines = [
                 f"🤖 BOT DURUMU — {VERSION}",
                 f"",
                 f"Son tarama     : {last_str}",
                 f"Toplam tarama  : {_bot_state['scan_count']}",
-                f"Aktif sinyal   : {active_count}",
                 f"Otomatik işlem : {auto_str}",
                 f"Seans          : {sess_str}",
                 f"",
-                f"Min skor (dinamik) : {adaptive.get('min_score', MIN_BUY_SCORE)}",
-                f"Stop %  (dinamik)  : {adaptive.get('stop_pct', STOP_LOSS_PCT)*100:.1f}%",
+                f"🛡 KORUMA SİSTEMİ",
+                f"  Devre kesici : {cb_str}",
+                f"  BTC 15 dk    : {btc_15m_str}",
+                f"",
+                f"📐 DİNAMİK PARAMETRELER",
+                f"  Min skor : {adaptive.get('min_score', MIN_BUY_SCORE)}",
+                f"  Stop %   : {adaptive.get('stop_pct', STOP_LOSS_PCT)*100:.1f}%",
             ]
             if not market_intel.is_stale():
                 lines.append("")
@@ -1361,9 +1409,37 @@ def run_bot() -> None:
             btc = tickers_map.get("BTCUSDT")
             btc_change = safe_float(btc["priceChangePercent"]) if btc else 0.0
 
+            # BTC fiyatını izleyiciye kaydet
+            btc_price = safe_float(btc["lastPrice"]) if btc else 0.0
+            btc_tracker.record(btc_price)
+
+            # Flash crash kontrolü
+            btc_15m = btc_tracker.change_in_minutes(15)
+            btc_5m  = btc_tracker.change_in_minutes(5)
+            crash_msg = detect_flash_crash(btc_15m, btc_5m)
+            if crash_msg:
+                send_telegram(f"⚡ FLASH CRASH ALARMI\n{crash_msg}")
+
+            # Portfolio drawdown hesapla
+            drawdown = compute_portfolio_drawdown(state, tickers_map)
+
+            # Devre kesici değerlendir
+            cb_state = circuit_breaker.evaluate(btc_15m, btc_change, drawdown)
+            alert    = circuit_breaker.alert_message()
+            if alert and cb_state != _bot_state.get("last_cb_state"):
+                send_telegram(alert)
+                if cb_state == "CRITICAL" and AUTO_TRADE_ENABLED:
+                    send_telegram("🔴 ACİL ÇIKIŞ: Tüm pozisyonlar kapatılıyor...")
+                    result = sell_all_to_usdt(client, get_balances(client))
+                    sold_names = [s["symbol"].replace("USDT","") for s in result["sold"]]
+                    send_telegram(f"✅ Kapatılan: {', '.join(sold_names) if sold_names else 'Yok'}")
+            _bot_state["last_cb_state"] = cb_state
+
             logger.info(
-                "Tarama — BTC 24s: %.2f%%  USDT: %.2f  MinSkor: %d  Stop: %.1f%%",
-                btc_change, usdt_balance, eff_min_score, eff_stop_pct * 100,
+                "Tarama — BTC 24s: %.2f%%  15m: %s  CB: %s  DD: %.1f%%  USDT: %.2f",
+                btc_change,
+                f"{btc_15m:.1f}%" if btc_15m is not None else "?",
+                cb_state, drawdown, usdt_balance,
             )
 
             candidates = prefilter_candidates(tickers_map, MIN_VOLUME_USDT)
@@ -1378,9 +1454,12 @@ def run_bot() -> None:
 
             check_active_signals(state, tickers_map, client)
 
-            market_paused = btc_change < BTC_PAUSE_THRESHOLD
+            market_paused = btc_change < BTC_PAUSE_THRESHOLD or not circuit_breaker.can_open_position()
             if market_paused:
-                logger.info("Piyasa durduruldu: BTC %.2f%%", btc_change)
+                logger.info("Piyasa durduruldu: BTC %.2f%%  CB:%s", btc_change, cb_state)
+
+            # Pozisyon büyüklüğü çarpanı (devre kesici + volatilite)
+            cb_mult = circuit_breaker.position_size_multiplier()
 
             new_signals: list = []
             if not market_paused:
@@ -1395,13 +1474,15 @@ def run_bot() -> None:
                     if adjusted_score < eff_min_score:
                         continue
                     if should_send_new_signal(coin["symbol"], adjusted_score, state, balances):
-                        coin["score"] = adjusted_score   # güncellenmiş skoru kullan
+                        coin["score"] = adjusted_score
                         signal = create_signal(coin, effective_usdt)
                         entry = signal["entry"]
                         signal["stop"]    = round(entry * (1 - eff_stop_pct), 8)
                         signal["target1"] = round(entry * (1 + TARGET1_PCT), 8)
                         signal["target2"] = round(entry * (1 + TARGET2_PCT), 8)
                         signal["intel_bonus"] = intel_bonus
+                        # Volatilite ayarı
+                        signal["amount"] = round(signal["amount"] * cb_mult, 2)
 
                         state["signals"][coin["symbol"]] = signal
                         new_signals.append(signal)
