@@ -580,6 +580,7 @@ COMMANDS_HELP = """📋 Kullanılabilir komutlar:
 /bakiye    — Binance spot bakiyeni gösterir
 /sinyaller — Aktif açık sinyalleri listeler
 /durum     — Bot durumu ve son tarama bilgisi
+/simulate  — Son 2 günlük 200 USDT simülasyonu çalıştır
 /yardim    — Bu listeyi gösterir"""
 
 _bot_state: dict = {"last_scan": None, "scan_count": 0}
@@ -658,6 +659,16 @@ def start_command_listener(client: Client) -> None:
             )
             if callback_id:
                 _answer_callback(callback_id)
+
+        elif text == "/simulate":
+            send_telegram("⏳ 2 günlük simülasyon başlatılıyor (3-5 dk sürebilir)...")
+            if callback_id:
+                _answer_callback(callback_id, "Simülasyon başlatıldı...")
+            threading.Thread(
+                target=_run_simulation_and_report,
+                args=(client,),
+                daemon=True,
+            ).start()
 
         elif text in ("/yardim", "/help", "/start"):
             send_telegram(COMMANDS_HELP)
@@ -738,6 +749,168 @@ def _handle_portfolio(client: Client) -> None:
 # ---------------------------------------------------------------------------
 # Ana döngü
 # ---------------------------------------------------------------------------
+
+def _run_simulation_and_report(client: Client) -> None:
+    """2 günlük 200 USDT simülasyonu çalıştırıp Telegram'a rapor gönderir."""
+    try:
+        from datetime import timezone as _tz
+        import pandas as pd
+
+        SIM_BALANCE   = 200.0
+        SIM_DAYS      = 2
+        SIM_MIN_SCORE = 82
+        SIM_STOP      = 0.045
+        SIM_T1        = 0.06
+        SIM_T2        = 0.13
+        SIM_TOP_N     = 15
+        SIM_WARMUP    = 250
+        SIM_ALLOC_80  = 0.15
+        SIM_ALLOC_75  = 0.10
+        SIM_MAX_POS   = 3
+
+        now_tr      = datetime.now(_tz.utc).replace(tzinfo=None)
+        total_hours = SIM_DAYS * 24
+        total_cndl  = SIM_WARMUP + total_hours
+
+        all_tickers = get_tickers_map(client)
+        candidates  = prefilter_candidates(all_tickers, MIN_VOLUME_USDT)[:SIM_TOP_N]
+
+        btc_raw = client.get_klines(symbol="BTCUSDT", interval="1h", limit=total_cndl)
+        btc_close = [float(r[4]) for r in btc_raw]
+
+        balance   = SIM_BALANCE
+        positions = {}
+        closed    = []
+        signals   = []
+
+        def _psize(bal, score):
+            pct = SIM_ALLOC_80 if score >= 80 else SIM_ALLOC_75
+            return round(bal * pct, 2)
+
+        for sym in candidates:
+            try:
+                raw = client.get_klines(symbol=sym, interval="1h", limit=total_cndl)
+                time.sleep(0.15)
+            except Exception:
+                continue
+            if not raw or len(raw) < SIM_WARMUP + 2:
+                continue
+
+            df = pd.DataFrame(raw, columns=[
+                "ot","open","high","low","close","volume",
+                "ct","qv","t","tbb","tbq","i"
+            ])
+            for c in ("open","high","low","close","volume","qv"):
+                df[c] = df[c].astype(float)
+            df = df.rename(columns={"qv": "quote_volume"})
+
+            for i in range(SIM_WARMUP, len(df)):
+                hi = i - SIM_WARMUP
+                if hi >= total_hours:
+                    break
+                price = float(df["close"].iloc[i])
+
+                if sym in positions:
+                    pos = positions[sym]
+                    if price >= pos["t2"]:
+                        pnl = (price - pos["entry"]) / pos["entry"] * pos["amount"]
+                        balance += pos["amount"] + pnl
+                        closed.append({"sym": sym, "res": "🎯H2", "pnl": pnl,
+                                       "pct": (price-pos["entry"])/pos["entry"]*100})
+                        del positions[sym]
+                    elif price >= pos["t1"] and not pos.get("t1"):
+                        pos["t1"] = True
+                        half = pos["amount"] / 2
+                        pnl  = (price - pos["entry"]) / pos["entry"] * half
+                        balance += half + pnl
+                        pos["amount"] -= half
+                        pos["stop"]    = pos["entry"]
+                    elif price <= pos["stop"]:
+                        pnl = (price - pos["entry"]) / pos["entry"] * pos["amount"]
+                        balance += pos["amount"] + pnl
+                        closed.append({"sym": sym, "res": "🛑STOP", "pnl": pnl,
+                                       "pct": (price-pos["entry"])/pos["entry"]*100})
+                        del positions[sym]
+                    continue
+
+                if len(positions) >= SIM_MAX_POS:
+                    continue
+
+                df_sl = df.iloc[: i + 1][["open","high","low","close","volume","quote_volume"]].copy()
+                ind   = build_indicators(df_sl)
+                if ind is None:
+                    continue
+
+                btc_idx  = min(i, len(btc_close)-1)
+                btc_prev = btc_close[max(0, btc_idx-24)]
+                btc_chg  = ((btc_close[btc_idx]-btc_prev)/btc_prev*100) if btc_prev else 0
+                if btc_chg < -2:
+                    continue  # BTC düşerken sinyal üretme
+
+                ch24 = 0.0
+                if i >= 24:
+                    p24 = float(df["close"].iloc[i-24])
+                    ch24 = (price - p24) / p24 * 100 if p24 else 0
+
+                fticker = {"symbol": sym, "lastPrice": str(price),
+                           "priceChangePercent": str(round(ch24, 4)),
+                           "quoteVolume": str(float(df["quote_volume"].iloc[max(0,i-23):i+1].sum()))}
+                coin = score_coin(fticker, btc_chg, ind)
+                if not coin or coin["score"] < SIM_MIN_SCORE:
+                    continue
+
+                amt = _psize(balance, coin["score"])
+                if amt < 5 or amt > balance * 0.95:
+                    continue
+
+                balance -= amt
+                positions[sym] = {
+                    "entry": price, "amount": amt,
+                    "stop": price*(1-SIM_STOP),
+                    "t1":   price*(1+SIM_T1),
+                    "t2":   price*(1+SIM_T2),
+                }
+                signals.append(f"  Saat {hi:02d}:00  {sym}  Skor:{coin['score']}  {coin.get('tier','')}  Giriş:{price:.4f}  Tutar:{amt:.0f}$")
+
+        for sym, pos in list(positions.items()):
+            try:
+                lr = client.get_klines(symbol=sym, interval="1h", limit=2)
+                lp = float(lr[-1][4])
+            except Exception:
+                lp = pos["entry"]
+            pnl = (lp - pos["entry"]) / pos["entry"] * pos["amount"]
+            balance += pos["amount"] + pnl
+            closed.append({"sym": sym, "res": "⏰AÇIK", "pnl": pnl,
+                           "pct": (lp-pos["entry"])/pos["entry"]*100})
+
+        total_pnl = balance - SIM_BALANCE
+        pct       = total_pnl / SIM_BALANCE * 100
+        wins      = [c for c in closed if c["pnl"] > 0]
+        wr        = len(wins)/len(closed)*100 if closed else 0
+        emoji     = "🟢" if total_pnl >= 0 else "🔴"
+
+        lines = [
+            f"📊 2 GÜNLÜK SİMÜLASYON SONUCU",
+            f"Başlangıç : 200.00 USDT",
+            f"{emoji} Toplam PnL: {total_pnl:+.2f} USDT  [{pct:+.2f}%]",
+            f"Sinyal sayısı : {len(signals)}",
+            f"İşlem sayısı  : {len(closed)}",
+            f"Kazanma oranı : %{wr:.0f}\n",
+        ]
+        if signals:
+            lines.append("AL SİNYALLERİ:")
+            lines += signals
+        if closed:
+            lines.append("\nKAPANAN İŞLEMLER:")
+            for c in closed:
+                lines.append(f"  {c['res']}  {c['sym']}  {c['pnl']:+.2f}$  ({c['pct']:+.1f}%)")
+        lines.append("\n⚠️ Geçmiş performans gelecek sonuçları garantilemez.")
+        send_telegram("\n".join(lines))
+
+    except Exception as exc:
+        logger.exception("Simülasyon hatası: %s", exc)
+        send_telegram(f"⚠️ Simülasyon hatası: {exc}")
+
 
 def run_bot() -> None:
     client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
