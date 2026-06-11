@@ -24,13 +24,19 @@ load_dotenv()
 STARTING_BALANCE_TL   = 10_000.0
 TL_TO_USDT            = 0.0182          # 1 TL ≈ 0.0182 USDT (güncelle gerekirse)
 STARTING_BALANCE      = round(STARTING_BALANCE_TL * TL_TO_USDT, 2)  # ~182 USDT
-MIN_SCORE        = 70
-STOP_LOSS_PCT    = 0.03
-TARGET1_PCT      = 0.04
-TARGET2_PCT      = 0.08
-TOP_N_COINS      = 15           # Kaç coin taransın
-WARMUP_CANDLES   = 250          # EMA50 için ısınma periyodu
-TZ_OFFSET_HOURS  = 3            # Türkiye UTC+3
+
+# ── EN İYİ SENARYO parametreleri ─────────────────────────────────────────
+MIN_SCORE        = 75           # Sadece güçlü sinyaller (75+)
+STOP_LOSS_PCT    = 0.025        # Stop %2.5
+TARGET1_PCT      = 0.05         # Hedef 1 %5
+TARGET2_PCT      = 0.12         # Hedef 2 %12
+TOP_N_COINS      = 20
+WARMUP_CANDLES   = 250
+TZ_OFFSET_HOURS  = 3
+
+ALLOC_SCORE_80   = 0.30         # 80+ skor → bakiyenin %30'u
+ALLOC_SCORE_75   = 0.20         # 75+ skor → bakiyenin %20'si
+MAX_OPEN_POS     = 3            # Aynı anda max 3 pozisyon
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
@@ -45,11 +51,9 @@ BANNED   = ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "FDUSD", "TUSD", "USDC
 
 def pos_size(balance: float, score: int) -> float:
     if score >= 80:
-        return round(balance * 0.15, 2)
-    elif score >= 75:
-        return round(balance * 0.10, 2)
+        return round(balance * ALLOC_SCORE_80, 2)
     else:
-        return round(balance * 0.05, 2)
+        return round(balance * ALLOC_SCORE_75, 2)
 
 
 def is_valid(symbol: str) -> bool:
@@ -188,6 +192,9 @@ def run_simulation():
                 continue   # Aynı coin için yeni sinyal açma
 
             # --- Sinyal kontrolü ---
+            if len(positions) >= MAX_OPEN_POS:
+                continue   # Max pozisyon sayısına ulaşıldı
+
             df_slice = df.iloc[: i + 1].copy()
             ind = build_indicators(df_slice)
             if ind is None:
@@ -207,8 +214,9 @@ def run_simulation():
             if coin is None or coin["score"] < MIN_SCORE:
                 continue
 
+            # Bileşik kazanç: kapanan işlemlerden gelen para yeni pozisyonlara yansır
             amount = pos_size(balance, coin["score"])
-            if amount < 10 or amount > balance * 0.9:
+            if amount < 5 or amount > balance * 0.95:
                 continue
 
             balance -= amount
@@ -262,12 +270,11 @@ def run_simulation():
     print(f"\n{'='*62}")
     print(f"  📊  SİMÜLASYON SONUÇLARI")
     print(f"{'='*62}")
-    tl_balance   = round(balance / TL_TO_USDT, 0)
-    tl_pnl       = round(total_pnl / TL_TO_USDT, 0)
-    print(f"  Başlangıç bakiye  : {STARTING_BALANCE:>8.2f} USDT  ({STARTING_BALANCE_TL:,.0f} TL)")
-    print(f"  Bitiş bakiye      : {balance:>8.2f} USDT  ({tl_balance:,.0f} TL)")
+    tl_pnl  = round(total_pnl / TL_TO_USDT, 0)
     pnl_sign = "+" if total_pnl >= 0 else ""
-    print(f"  Toplam PnL        : {pnl_sign}{total_pnl:>7.2f} USDT  ({pnl_sign}{tl_pnl:,.0f} TL)  ({pnl_sign}{total_pnl_pct:.2f}%)")
+    emoji = "🟢" if total_pnl >= 0 else "🔴"
+    print(f"  Başlangıç   : {STARTING_BALANCE_TL:>8,.0f} TL  ({STARTING_BALANCE:.2f} USDT)")
+    print(f"  Toplam PnL  : {emoji} {pnl_sign}{tl_pnl:>6,.0f} TL  ({pnl_sign}{total_pnl:.2f} USDT)  [{pnl_sign}{total_pnl_pct:.2f}%]")
     print(f"{'─'*62}")
     print(f"  Toplam sinyal     : {len(signals)}")
     print(f"  Kapatılan işlem   : {len(closed)}")
