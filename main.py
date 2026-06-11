@@ -309,32 +309,47 @@ def check_active_signals(state: dict, tickers_map: dict) -> None:
         amount    = signal.get("amount", 0)
         pnl_usd   = round(amount * pnl / 100, 2)
 
+        # 1. Hedef geçildikten sonra stop'u giriş fiyatına otomatik yükselt (kârı koru)
+        if signal.get("t1_sent") and not signal.get("stop_raised") and price > signal["entry"]:
+            signal["stop"] = signal["entry"]
+            signal["stop_raised"] = True
+
         if price >= signal["target2"]:
             signal["status"] = "target2"
             signal["time"] = now_str
             send_telegram(
                 f"🎯 {coin_name} — 2. HEDEFE ULAŞTI!\n\n"
-                f"Tüm pozisyonu sat.\n"
+                f"Tüm pozisyonu sat — harika iş!\n"
                 f"💰 Tahmini kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
             )
 
         elif price >= signal["target1"] and not signal.get("t1_sent"):
             signal["t1_sent"] = True
-            half_usd = round(pnl_usd / 2, 2)
+            signal["stop"] = signal["entry"]   # stop sıfıra çekiliyor — kâr garantileniyor
+            signal["stop_raised"] = True
             send_telegram(
                 f"✅ {coin_name} — 1. HEDEFE ULAŞTI!\n\n"
-                f"Yarısını sat, geri kalanı için stop-loss'u giriş fiyatına ({signal['entry']:.6f}) çek.\n"
+                f"Yarısını sat, geri kalanı için stop-loss otomatik olarak giriş fiyatına çekildi.\n"
+                f"Artık kalan yarıda zarar etmezsin — sadece kazanabilirsin.\n"
                 f"💰 Şu anki kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
             )
 
         elif price <= signal["stop"]:
             signal["status"] = "stopped"
             signal["time"] = now_str
-            send_telegram(
-                f"🛑 {coin_name} — ZARAR KES TETİKLENDİ\n\n"
-                f"Pozisyonu sat, zararı daha büyümeden çık.\n"
-                f"💸 Tahmini zarar: {pnl_usd:.2f} USDT  (%{pnl:.1f})"
-            )
+            if signal.get("stop_raised"):
+                # Stop giriş fiyatına çekilmişti — kâr korunmuş halde çıkış
+                send_telegram(
+                    f"🔒 {coin_name} — POZİSYON KAPATILDI\n\n"
+                    f"1. hedef kârın zaten cebinde, kalan yarı giriş fiyatından çıktı.\n"
+                    f"Net sonuç: kârdaydın, zarar etmedin. ✅"
+                )
+            else:
+                send_telegram(
+                    f"🛑 {coin_name} — ZARAR KES TETİKLENDİ\n\n"
+                    f"Pozisyonu sat, zararı daha büyümeden çık.\n"
+                    f"💸 Tahmini zarar: {pnl_usd:.2f} USDT  (%{pnl:.1f})"
+                )
 
 
 # ---------------------------------------------------------------------------
