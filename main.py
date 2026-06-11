@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from binance.client import Client
@@ -182,7 +182,7 @@ def should_send_new_signal(
     existing = state["signals"].get(symbol)
     if existing:
         last_time = datetime.fromisoformat(existing["time"])
-        elapsed = datetime.utcnow() - last_time
+        elapsed = datetime.now(timezone.utc).replace(tzinfo=None) - last_time
         if elapsed < timedelta(hours=SIGNAL_COOLDOWN_HOURS):
             if score < existing["score"] + SIGNAL_RESEND_SCORE_DELTA:
                 return False  # Cooldown içinde, skor yeterince artmadı
@@ -198,7 +198,7 @@ def create_signal(coin: dict, usdt_balance: float) -> dict:
     pos = position_size(usdt_balance, coin["score"])
     return {
         "symbol": coin["symbol"],
-        "time": datetime.utcnow().isoformat(),
+        "time": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "entry": entry,
         "stop": round(entry * (1 - STOP_LOSS_PCT), 8),
         "target1": round(entry * (1 + TARGET1_PCT), 8),
