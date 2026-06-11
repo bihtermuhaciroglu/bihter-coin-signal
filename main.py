@@ -15,6 +15,10 @@ from indicators import (
     analyze_candidates,
     prefilter_candidates,
     safe_float,
+    get_klines_df,
+    build_indicators,
+    score_coin,
+    is_valid_symbol,
 )
 
 load_dotenv()
@@ -399,6 +403,174 @@ def portfolio_report(balances: dict, scored: list, state: dict = None) -> None:
 # Telegram komut dinleyici (polling)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tek coin analizi (doğal dil cevabı)
+# ---------------------------------------------------------------------------
+
+def analyze_single_coin(symbol: str, client: Client) -> None:
+    """Bir coini analiz edip Telegram'a doğal dil cevabı gönderir."""
+    send_telegram(f"🔍 {symbol} analiz ediliyor...")
+    try:
+        df = get_klines_df(client, symbol)
+        if df is None:
+            send_telegram(f"⚠️ {symbol} için veri alınamadı. Sembol doğru mu?")
+            return
+
+        ind = build_indicators(df)
+        del df
+        if ind is None:
+            send_telegram(f"⚠️ {symbol} için indikatör hesaplanamadı.")
+            return
+
+        ticker_raw = client.get_ticker(symbol=symbol)
+        btc_raw = client.get_ticker(symbol="BTCUSDT")
+        btc_change = safe_float(btc_raw["priceChangePercent"])
+
+        ticker = {
+            "symbol": symbol,
+            "lastPrice": str(ticker_raw["lastPrice"]),
+            "priceChangePercent": str(ticker_raw["priceChangePercent"]),
+            "quoteVolume": str(ticker_raw["quoteVolume"]),
+        }
+        coin = score_coin(ticker, btc_change, ind)
+        if coin is None:
+            send_telegram(f"⚠️ {symbol} skorlanamadı.")
+            return
+
+        rsi = ind["rsi"]
+        ema_bull = ind["ema20"] > ind["ema50"] > 0
+        macd_bull = ind["macd_hist"] > 0
+        macd_cross = macd_bull and ind["macd_prev_hist"] <= 0
+
+        # RSI yorumu
+        if rsi < 25:
+            rsi_yorum = "⚡ Aşırı satılmış — güçlü alım fırsatı olabilir"
+        elif rsi < 40:
+            rsi_yorum = "📉 Oversold bölgesi — alım bölgesine yakın"
+        elif rsi < 55:
+            rsi_yorum = "➡️ Nötr bölge — yön bekleniyor"
+        elif rsi < 70:
+            rsi_yorum = "📈 Güçlü momentum devam ediyor"
+        else:
+            rsi_yorum = "🔴 Aşırı alınmış — dikkatli ol, düzeltme gelebilir"
+
+        # EMA yorumu
+        ema_yorum = "📈 Trend yukarı (EMA20 > EMA50)" if ema_bull else "📉 Trend aşağı (EMA20 < EMA50)"
+
+        # MACD yorumu
+        if macd_cross:
+            macd_yorum = "🔔 Taze boğa kesişimi — momentum dönüyor!"
+        elif macd_bull:
+            macd_yorum = "✅ MACD pozitif — momentum güçlü"
+        else:
+            macd_yorum = "⚠️ MACD negatif — momentum zayıf"
+
+        # BB yorumu
+        bb_lower = ind["bb_lower"]
+        bb_upper = ind["bb_upper"]
+        close = ind["close"]
+        bb_yorum = ""
+        if bb_lower > 0 and bb_upper > 0:
+            bb_range = bb_upper - bb_lower
+            if bb_range > 0:
+                pos = (close - bb_lower) / bb_range
+                if pos < 0.2:
+                    bb_yorum = "📌 Fiyat BB alt bandına yakın — potansiyel zıplama noktası"
+                elif pos > 0.8:
+                    bb_yorum = "⚠️ Fiyat BB üst bandına yakın — dikkat"
+
+        # Genel sonuç
+        score = coin["score"]
+        if score >= 80:
+            sonuc = f"🔥 GÜÇLÜ AL SİNYALİ ({coin['tier']})\nBu coin şu an sistemin en iyi fırsatları arasında."
+        elif score >= 75:
+            sonuc = f"⚡ İYİ FIRSAT ({coin['tier']})\nTakibe değer, girişi değerlendirilebilir."
+        elif score >= 70:
+            sonuc = f"👀 TAKİBE DEĞER ({coin['tier']})\nHenüz erken, biraz daha bekle."
+        elif score >= 60:
+            sonuc = "😐 NÖTR GÖRÜNÜM\nNe güçlü al ne de sat. İzlemeye devam."
+        else:
+            sonuc = "❌ ZAYIF GÖRÜNÜM\nŞu an bu coinden uzak durmak daha sağlıklı."
+
+        lines = [
+            f"🔍 {symbol} ANALİZİ\n",
+            f"💰 Fiyat   : {coin['price']:.6f} USDT",
+            f"📊 24s     : %{coin['change']:+.2f}  |  Hacim: {coin['vol_spike']:.1f}x",
+            f"📐 Momentum: %{coin['roc3']:+.2f} (son 3 mum)\n",
+            "📈 TEKNİK GÖSTERGELER:",
+            f"• RSI {rsi:.0f}  → {rsi_yorum}",
+            f"• {ema_yorum}",
+            f"• {macd_yorum}",
+        ]
+        if bb_yorum:
+            lines.append(f"• {bb_yorum}")
+
+        lines += [
+            f"\n🎯 Skor : {score}/100",
+            f"\n💬 {sonuc}",
+        ]
+
+        send_telegram("\n".join(lines))
+
+    except Exception as exc:
+        logger.error("analyze_single_coin hata %s: %s", symbol, exc)
+        send_telegram(f"⚠️ {symbol} analiz edilirken hata oluştu: {exc}")
+
+
+def _extract_symbol(text: str) -> str | None:
+    """Metinden coin sembolü çıkarmaya çalışır. 'sol', 'SOL', 'SOLUSDT' → 'SOLUSDT'"""
+    words = text.upper().replace("?", "").replace("!", "").replace(",", "").split()
+    for word in words:
+        if word.endswith("USDT") and len(word) >= 6:
+            return word
+        candidate = word + "USDT"
+        if 4 <= len(candidate) <= 12 and candidate.isalnum():
+            return candidate
+    return None
+
+
+def handle_free_text(text: str, client: Client) -> None:
+    """Komut olmayan serbest metin mesajlarını anlar ve cevap üretir."""
+    text_lower = text.lower()
+
+    # Coin analizi isteği tespiti
+    symbol = _extract_symbol(text)
+    analysis_keywords = ["nasıl", "ne durumda", "alsam", "almalı", "analiz", "bak", "incele", "nerede", "ne olur"]
+    wants_analysis = symbol and any(kw in text_lower for kw in analysis_keywords)
+
+    if wants_analysis or (symbol and len(text.split()) <= 3):
+        analyze_single_coin(symbol, client)
+        return
+
+    # Genel soru tespiti
+    if any(kw in text_lower for kw in ["ne alsam", "öner", "hangi coin", "fırsat", "tavsiye"]):
+        _handle_portfolio(client)
+        return
+
+    if any(kw in text_lower for kw in ["portföy", "durumum", "coinlerim"]):
+        _handle_portfolio(client)
+        return
+
+    if any(kw in text_lower for kw in ["bakiye", "param", "usdt", "para"]):
+        try:
+            balances = get_balances(client)
+            usdt = get_usdt_balance(balances)
+            send_telegram(f"💰 Spot USDT bakiyen: {usdt:.4f} USDT")
+        except Exception as exc:
+            send_telegram(f"⚠️ Bakiye alınamadı: {exc}")
+        return
+
+    # Bilinmeyen mesaj
+    send_telegram(
+        "🤔 Anlayamadım. Şöyle yazabilirsin:\n\n"
+        "• *SOL nasıl?* — coin analizi\n"
+        "• *Ne alsam?* — fırsat önerisi\n"
+        "• */bakiye* — hesabını göster\n"
+        "• */sinyaller* — açık sinyaller\n"
+        "• */yardim* — tüm komutlar"
+    )
+
+
 COMMANDS_HELP = """📋 Kullanılabilir komutlar:
 
 /portfolio — Anlık portföy analizi ve rotasyon önerileri
@@ -507,8 +679,12 @@ def start_command_listener(client: Client) -> None:
                     # Normal mesaj komutları
                     msg = update.get("message", {})
                     text = (msg.get("text") or "").strip()
-                    if text.startswith("/"):
+                    if not text:
+                        pass
+                    elif text.startswith("/"):
                         _handle_command(text.split()[0])
+                    else:
+                        handle_free_text(text, client)
 
                     # Inline buton callback'leri (✅ Aldım / ❌ Atladım)
                     cb = update.get("callback_query", {})
