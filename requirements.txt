@@ -1,5 +1,6 @@
-requests
-python-dotenv
-python-binance
-pandas
-ta
+requests>=2.31.0
+python-dotenv>=1.0.0
+python-binance>=1.0.19
+numpy>=1.26.0
+pandas>=2.1.0
+ta>=0.11.0
