@@ -229,48 +229,58 @@ def create_signal(coin: dict, usdt_balance: float) -> dict:
     }
 
 
+def _signal_strength_label(score: int) -> str:
+    """Skoru kullanıcı dostu güç etiketine çevirir."""
+    if score >= 90:
+        return "🔥 Çok Güçlü Sinyal"
+    if score >= 85:
+        return "💪 Güçlü Sinyal"
+    return "✅ Geçerli Sinyal"
+
+
 def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: float = None) -> None:
     eff = effective_usdt or usdt_balance
-    lines = [
-        f"🚀 AL SİNYALİ — {VERSION}",
-        f"💰 Spot USDT: {usdt_balance:.2f}",
-    ]
-
-    if eff != usdt_balance:
-        lines.append(f"📐 Pozisyon hesabı: {eff:.2f} USDT üzerinden\n")
-    else:
-        lines.append("")
 
     if usdt_balance < 10:
-        lines.append(
-            f"⚠️ Spot bakiyen çok düşük ({usdt_balance:.2f} USDT). "
-            "Anlamlı işlem için en az 50 USDT önerilir.\n"
+        send_telegram(
+            f"⚠️ Bakiyen çok düşük ({usdt_balance:.2f} USDT) — işlem yapılamaz.\n"
+            "Anlamlı alım için en az 50 USDT gerekli."
         )
+        return
 
-    for idx, sig in enumerate(new_signals, 1):
-        ema_arrow = "↑" if "YUKARI" in sig.get("ema_trend", "") else "↓"
-        tier = sig.get("tier", "")
-        lines += [
-            f"{idx}) {sig['symbol']}  {tier}",
-            f"   Skor    : {sig['score']}/100",
-            f"   RSI     : {sig['rsi']}  |  EMA: {ema_arrow}  |  MACD: {sig['macd']}  |  Hacim: {sig['vol_spike']}x  |  ROC3: {sig['roc3']:+.1f}%",
-            f"   Giriş   : {sig['entry']:.6f}",
-            f"   Tutar   : {sig['amount']} USDT  (bakiyenin %{sig['alloc_pct']}'i | max risk: %{sig['portfolio_risk_pct']} portföy)",
-            f"   Stop    : {sig['stop']:.6f}",
-            f"   Hedef 1 : {sig['target1']:.6f}",
-            f"   Hedef 2 : {sig['target2']:.6f}\n",
+    for sig in new_signals:
+        strength = _signal_strength_label(sig["score"])
+        coin_name = sig["symbol"].replace("USDT", "")
+        entry  = sig["entry"]
+        stop   = sig["stop"]
+        t1     = sig["target1"]
+        t2     = sig["target2"]
+        amount = sig["amount"]
+        risk_usd = round(amount * STOP_LOSS_PCT, 2)
+        gain1_usd = round(amount * TARGET1_PCT, 2)
+        gain2_usd = round(amount * TARGET2_PCT, 2)
+
+        lines = [
+            f"📢 AL SİNYALİ — {coin_name}",
+            f"{strength}",
+            "",
+            f"💵 Ne kadar al?  →  {amount} USDT",
+            f"📌 Alım fiyatı  →  {entry:.6f}",
+            "",
+            f"🛑 Zarar kes    →  {stop:.6f}  (−{risk_usd:.2f} USDT kaybedersin)",
+            f"🎯 1. Hedef     →  {t1:.6f}  (+{gain1_usd:.2f} USDT kazanırsın)",
+            f"🎯 2. Hedef     →  {t2:.6f}  (+{gain2_usd:.2f} USDT kazanırsın)",
+            "",
+            f"💡 Öneri: Alındıktan sonra stop-loss emirini borsa üzerinde {stop:.6f} fiyatına gir.",
+            "",
+            f"📊 Bakiyen: {usdt_balance:.2f} USDT  |  Bu işlem: %{sig['alloc_pct']} bakiyenden",
         ]
 
-    lines.append("⚠️ Otomatik alım değildir. İşlem öncesi grafiği kontrol et.")
-
-    buttons = []
-    for sig in new_signals:
-        buttons.append([
-            {"text": f"✅ {sig['symbol']} Aldım", "callback_data": f"bought_{sig['symbol']}"},
+        buttons = [[
+            {"text": f"✅ Aldım", "callback_data": f"bought_{sig['symbol']}"},
             {"text": "❌ Atladım", "callback_data": f"skip_{sig['symbol']}"},
-        ])
-
-    send_telegram("\n".join(lines), reply_markup={"inline_keyboard": buttons})
+        ]]
+        send_telegram("\n".join(lines), reply_markup={"inline_keyboard": buttons})
 
 
 # ---------------------------------------------------------------------------
@@ -295,23 +305,36 @@ def check_active_signals(state: dict, tickers_map: dict) -> None:
 
         now_str = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
+        coin_name = symbol.replace("USDT", "")
+        amount    = signal.get("amount", 0)
+        pnl_usd   = round(amount * pnl / 100, 2)
+
         if price >= signal["target2"]:
             signal["status"] = "target2"
-            signal["time"] = now_str   # cooldown sıfırla — hemen yeniden al sinyali gitmesin
-            send_telegram(f"🎯 HEDEF 2 GELDİ — {symbol}\nKâr: %{pnl:.2f}")
+            signal["time"] = now_str
+            send_telegram(
+                f"🎯 {coin_name} — 2. HEDEFE ULAŞTI!\n\n"
+                f"Tüm pozisyonu sat.\n"
+                f"💰 Tahmini kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
+            )
 
         elif price >= signal["target1"] and not signal.get("t1_sent"):
             signal["t1_sent"] = True
+            half_usd = round(pnl_usd / 2, 2)
             send_telegram(
-                f"✅ HEDEF 1 GELDİ — {symbol}\n"
-                f"Kâr: %{pnl:.2f}\n"
-                "Stop seviyeni girişe çekmeyi düşün. Kısmi kâr alınabilir."
+                f"✅ {coin_name} — 1. HEDEFE ULAŞTI!\n\n"
+                f"Yarısını sat, geri kalanı için stop-loss'u giriş fiyatına ({signal['entry']:.6f}) çek.\n"
+                f"💰 Şu anki kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
             )
 
         elif price <= signal["stop"]:
             signal["status"] = "stopped"
-            signal["time"] = now_str   # cooldown sıfırla — stop'tan hemen sonra tekrar al gitmesin
-            send_telegram(f"🛑 STOP TETİKLENDİ — {symbol}\nZarar: %{pnl:.2f}")
+            signal["time"] = now_str
+            send_telegram(
+                f"🛑 {coin_name} — ZARAR KES TETİKLENDİ\n\n"
+                f"Pozisyonu sat, zararı daha büyümeden çık.\n"
+                f"💸 Tahmini zarar: {pnl_usd:.2f} USDT  (%{pnl:.1f})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -334,21 +357,44 @@ def _rotation_action(score: int, pnl_pct: float = None) -> str:
         return "🔄 BAŞKA COİNE GEÇ"
 
 
+def _plain_action(score: int, pnl_pct: float = None) -> str:
+    """Skora ve PnL'e göre sade Türkçe aksiyon metni üretir."""
+    if score >= 80:
+        if pnl_pct is not None and pnl_pct >= 10:
+            return "Yarısını sat, kârını koru"
+        return "Tut — hâlâ güçlü"
+    elif score >= 75:
+        if pnl_pct is not None and pnl_pct > 5:
+            return "Stop-loss'u giriş fiyatına çek"
+        return "İzle — henüz sat değil"
+    elif score >= 65:
+        if pnl_pct is not None and pnl_pct > 3:
+            return "Kısmi kâr al, bir miktar sat"
+        return "Pozisyonu azalt"
+    else:
+        return "Sat — daha iyi fırsat var"
+
+
 def portfolio_report(balances: dict, scored: list, state: dict = None) -> None:
     usdt = get_usdt_balance(balances)
     top3 = scored[:3]
 
     lines = [
-        f"📊 PORTFÖY RAPORU — {VERSION}",
-        f"💰 Spot USDT: {usdt:.2f}\n",
-        "🔥 En güçlü fırsatlar:",
+        f"📊 PORTFÖY RAPORU",
+        f"💰 Kullanılabilir USDT: {usdt:.2f}\n",
     ]
 
-    for idx, coin in enumerate(top3, 1):
-        lines.append(
-            f"  {idx}) {coin['symbol']}  {coin['tier']}  Skor: {coin['score']}/100  "
-            f"RSI: {coin['rsi']}  EMA: {coin['ema_trend']}  24s: %{coin['change']:.2f}"
-        )
+    # En iyi fırsatlar
+    if top3:
+        lines.append("🔥 Şu an en iyi fırsatlar:")
+        for idx, coin in enumerate(top3, 1):
+            coin_name = coin["symbol"].replace("USDT", "")
+            pos = position_size(usdt, coin["score"])
+            strength = _signal_strength_label(coin["score"])
+            lines.append(
+                f"  {idx}) {coin_name}  —  {strength}\n"
+                f"      Önerilen tutar: {pos['amount']} USDT  |  24 saatlik değişim: %{coin['change']:+.1f}"
+            )
 
     # Elindeki coinleri değerlendir
     holdings = []
@@ -358,45 +404,36 @@ def portfolio_report(balances: dict, scored: list, state: dict = None) -> None:
         sym = asset + "USDT"
         match = next((c for c in scored if c["symbol"] == sym), None)
         if match:
-            # Bilinen sinyal varsa PnL hesapla
             pnl_pct = None
             if state:
                 sig = state.get("signals", {}).get(sym)
                 if sig and sig.get("entry", 0) > 0:
                     current = match["price"]
                     pnl_pct = ((current - sig["entry"]) / sig["entry"]) * 100
-
-            holdings.append({
-                **match,
-                "amount": amount,
-                "pnl_pct": pnl_pct,
-            })
+            holdings.append({**match, "amount": amount, "pnl_pct": pnl_pct})
 
     if holdings:
         holdings.sort(key=lambda x: x["score"], reverse=True)
-        lines.append("\n📌 Elindeki coinler:")
-
+        lines.append("\n📌 Elindeki coinler için ne yapmalısın:")
         for h in holdings:
-            action = _rotation_action(h["score"], h.get("pnl_pct"))
-            pnl_str = f"  PnL: %{h['pnl_pct']:+.2f}" if h.get("pnl_pct") is not None else ""
-            lines.append(
-                f"  {action}  {h['symbol']}  {h['score']}/100  "
-                f"RSI: {h['rsi']}  EMA: {h['ema_trend']}  24s: %{h['change']:.2f}{pnl_str}"
-            )
+            coin_name = h["symbol"].replace("USDT", "")
+            action = _plain_action(h["score"], h.get("pnl_pct"))
+            pnl_str = f"  (Kâr/Zarar: %{h['pnl_pct']:+.1f})" if h.get("pnl_pct") is not None else ""
+            lines.append(f"  • {coin_name}{pnl_str}\n    👉 {action}")
 
-        # Rotasyon önerisi: en zayıf coin ile en güçlü fırsat arasında büyük fark varsa
+        # Rotasyon önerisi
         weakest = holdings[-1]
         strongest = top3[0] if top3 else None
         if strongest and strongest["score"] - weakest["score"] >= 20:
+            w_name = weakest["symbol"].replace("USDT", "")
+            s_name = strongest["symbol"].replace("USDT", "")
             lines += [
-                "\n🔄 ROTASYON ÖNERİSİ",
-                f"  Zayıf  : {weakest['symbol']} ({weakest['score']}/100)",
-                f"  Güçlü  : {strongest['symbol']} ({strongest['score']}/100  {strongest['tier']})",
-                f"  Öneri  : {weakest['symbol']} pozisyonunun bir kısmını "
-                f"{strongest['symbol']}'e taşımayı değerlendirebilirsin.",
+                f"\n🔄 ROTASYON ÖNERİSİ",
+                f"  {w_name} zayıflıyor → {s_name} daha güçlü görünüyor.",
+                f"  {w_name}'den çıkıp {s_name} almayı değerlendirebilirsin.",
             ]
     else:
-        lines.append("\nAçık coin pozisyonu görünmüyor.")
+        lines.append("\nElinde açık coin pozisyonu görünmüyor.")
 
     lines.append("\n⚠️ Bu yatırım tavsiyesi değildir.")
     send_telegram("\n".join(lines))
@@ -444,74 +481,77 @@ def analyze_single_coin(symbol: str, client: Client) -> None:
         ema_bull = ind["ema20"] > ind["ema50"] > 0
         macd_bull = ind["macd_hist"] > 0
         macd_cross = macd_bull and ind["macd_prev_hist"] <= 0
+        score = coin["score"]
+        coin_name = symbol.replace("USDT", "")
 
-        # RSI yorumu
-        if rsi < 25:
-            rsi_yorum = "⚡ Aşırı satılmış — güçlü alım fırsatı olabilir"
-        elif rsi < 40:
-            rsi_yorum = "📉 Oversold bölgesi — alım bölgesine yakın"
-        elif rsi < 55:
-            rsi_yorum = "➡️ Nötr bölge — yön bekleniyor"
-        elif rsi < 70:
-            rsi_yorum = "📈 Güçlü momentum devam ediyor"
-        else:
-            rsi_yorum = "🔴 Aşırı alınmış — dikkatli ol, düzeltme gelebilir"
-
-        # EMA yorumu
-        ema_yorum = "📈 Trend yukarı (EMA20 > EMA50)" if ema_bull else "📉 Trend aşağı (EMA20 < EMA50)"
-
-        # MACD yorumu
-        if macd_cross:
-            macd_yorum = "🔔 Taze boğa kesişimi — momentum dönüyor!"
-        elif macd_bull:
-            macd_yorum = "✅ MACD pozitif — momentum güçlü"
-        else:
-            macd_yorum = "⚠️ MACD negatif — momentum zayıf"
-
-        # BB yorumu
+        # Fiyatın bant içindeki konumu
         bb_lower = ind["bb_lower"]
         bb_upper = ind["bb_upper"]
-        close = ind["close"]
-        bb_yorum = ""
+        close    = ind["close"]
+        bb_pos_label = ""
         if bb_lower > 0 and bb_upper > 0:
-            bb_range = bb_upper - bb_lower
-            if bb_range > 0:
-                pos = (close - bb_lower) / bb_range
-                if pos < 0.2:
-                    bb_yorum = "📌 Fiyat BB alt bandına yakın — potansiyel zıplama noktası"
-                elif pos > 0.8:
-                    bb_yorum = "⚠️ Fiyat BB üst bandına yakın — dikkat"
+            rng = bb_upper - bb_lower
+            if rng > 0:
+                bb_pos = (close - bb_lower) / rng
+                if bb_pos < 0.2:
+                    bb_pos_label = "Fiyat dip bölgesinde — alım için iyi seviye"
+                elif bb_pos > 0.8:
+                    bb_pos_label = "Fiyat zirveye yakın — dikkatli ol"
 
-        # Genel sonuç
-        score = coin["score"]
-        if score >= 80:
-            sonuc = f"🔥 GÜÇLÜ AL SİNYALİ ({coin['tier']})\nBu coin şu an sistemin en iyi fırsatları arasında."
+        # Genel karar
+        if score >= 82:
+            karar     = "✅ AL"
+            aciklama  = "Sistemin tüm koşullarını geçti. Alım yapılabilir."
+            tutar_str = f"💵 Önerilen tutar: {position_size(None, score)['amount'] if False else '—'} USDT\n   (Bakiyeni sonraki mesajda hesaplamak için /bakiye yaz)"
         elif score >= 75:
-            sonuc = f"⚡ İYİ FIRSAT ({coin['tier']})\nTakibe değer, girişi değerlendirilebilir."
-        elif score >= 70:
-            sonuc = f"👀 TAKİBE DEĞER ({coin['tier']})\nHenüz erken, biraz daha bekle."
+            karar    = "👀 BEKLE"
+            aciklama = "İyi görünüyor ama henüz en yüksek güven eşiğine ulaşmadı. Biraz izle."
+            tutar_str = ""
         elif score >= 60:
-            sonuc = "😐 NÖTR GÖRÜNÜM\nNe güçlü al ne de sat. İzlemeye devam."
+            karar    = "😐 NÖTR"
+            aciklama = "Ne al ne sat. Piyasa net yön vermemiş."
+            tutar_str = ""
         else:
-            sonuc = "❌ ZAYIF GÖRÜNÜM\nŞu an bu coinden uzak durmak daha sağlıklı."
+            karar    = "❌ ALMA"
+            aciklama = "Zayıf görünüm. Şu an bu coinden uzak dur."
+            tutar_str = ""
+
+        # Trend özeti — arka planda ne var onu sade anlat
+        trend_parts = []
+        if ema_bull:
+            trend_parts.append("Fiyat yükseliş trendinde")
+        else:
+            trend_parts.append("Fiyat düşüş trendinde")
+        if macd_cross:
+            trend_parts.append("momentum yeni döndü")
+        elif macd_bull:
+            trend_parts.append("momentum güçlü")
+        else:
+            trend_parts.append("momentum zayıf")
+        if rsi < 35:
+            trend_parts.append("aşırı ucuz görünüyor")
+        elif rsi > 70:
+            trend_parts.append("aşırı pahalı görünüyor")
 
         lines = [
-            f"🔍 {symbol} ANALİZİ\n",
-            f"💰 Fiyat   : {coin['price']:.6f} USDT",
-            f"📊 24s     : %{coin['change']:+.2f}  |  Hacim: {coin['vol_spike']:.1f}x",
-            f"📐 Momentum: %{coin['roc3']:+.2f} (son 3 mum)\n",
-            "📈 TEKNİK GÖSTERGELER:",
-            f"• RSI {rsi:.0f}  → {rsi_yorum}",
-            f"• {ema_yorum}",
-            f"• {macd_yorum}",
+            f"🔍 {coin_name} ANALİZİ",
+            "",
+            f"💰 Güncel fiyat : {coin['price']:.6f} USDT",
+            f"📊 Son 24 saat  : %{coin['change']:+.2f}",
+            "",
+            f"📝 Durum özeti  : {', '.join(trend_parts)}.",
         ]
-        if bb_yorum:
-            lines.append(f"• {bb_yorum}")
+        if bb_pos_label:
+            lines.append(f"📌 {bb_pos_label}")
 
         lines += [
-            f"\n🎯 Skor : {score}/100",
-            f"\n💬 {sonuc}",
+            "",
+            f"━━━━━━━━━━━━━━━━━━",
+            f"🤖 KARAR  :  {karar}",
+            f"💬 {aciklama}",
         ]
+        if tutar_str:
+            lines.append(tutar_str)
 
         send_telegram("\n".join(lines))
 
