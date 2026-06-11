@@ -21,7 +21,9 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Simülasyon parametreleri
 # ---------------------------------------------------------------------------
-STARTING_BALANCE = 10_000.0     # USDT (ya da TL, aynı mantık)
+STARTING_BALANCE_TL   = 10_000.0
+TL_TO_USDT            = 0.0182          # 1 TL ≈ 0.0182 USDT (güncelle gerekirse)
+STARTING_BALANCE      = round(STARTING_BALANCE_TL * TL_TO_USDT, 2)  # ~182 USDT
 MIN_SCORE        = 70
 STOP_LOSS_PCT    = 0.03
 TARGET1_PCT      = 0.04
@@ -108,7 +110,7 @@ def run_simulation():
     print(f"{'='*62}")
     print(f"  Tarih      : {sim_start.strftime('%d %B %Y')} (Türkiye)")
     print(f"  Süre       : 00:00 → {sim_end.strftime('%H:%M')}")
-    print(f"  Başlangıç  : {STARTING_BALANCE:,.0f} USDT")
+    print(f"  Başlangıç  : {STARTING_BALANCE_TL:,.0f} TL  ≈  {STARTING_BALANCE:.2f} USDT")
     print(f"  Min skor   : {MIN_SCORE}+")
     print(f"  Stop       : -%{STOP_LOSS_PCT*100:.0f}  |  Hedef1: +%{TARGET1_PCT*100:.0f}  |  Hedef2: +%{TARGET2_PCT*100:.0f}")
     print(f"{'='*62}\n")
@@ -260,10 +262,12 @@ def run_simulation():
     print(f"\n{'='*62}")
     print(f"  📊  SİMÜLASYON SONUÇLARI")
     print(f"{'='*62}")
-    print(f"  Başlangıç bakiye  : {STARTING_BALANCE:>10,.2f} USDT")
-    print(f"  Bitiş bakiye      : {balance:>10,.2f} USDT")
+    tl_balance   = round(balance / TL_TO_USDT, 0)
+    tl_pnl       = round(total_pnl / TL_TO_USDT, 0)
+    print(f"  Başlangıç bakiye  : {STARTING_BALANCE:>8.2f} USDT  ({STARTING_BALANCE_TL:,.0f} TL)")
+    print(f"  Bitiş bakiye      : {balance:>8.2f} USDT  ({tl_balance:,.0f} TL)")
     pnl_sign = "+" if total_pnl >= 0 else ""
-    print(f"  Toplam PnL        : {pnl_sign}{total_pnl:>9,.2f} USDT  ({pnl_sign}{total_pnl_pct:.2f}%)")
+    print(f"  Toplam PnL        : {pnl_sign}{total_pnl:>7.2f} USDT  ({pnl_sign}{tl_pnl:,.0f} TL)  ({pnl_sign}{total_pnl_pct:.2f}%)")
     print(f"{'─'*62}")
     print(f"  Toplam sinyal     : {len(signals)}")
     print(f"  Kapatılan işlem   : {len(closed)}")
