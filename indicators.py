@@ -11,7 +11,7 @@ from binance.client import Client
 logger = logging.getLogger(__name__)
 
 KLINE_INTERVAL = Client.KLINE_INTERVAL_1HOUR
-KLINE_LIMIT = 60
+KLINE_LIMIT = 250  # EMA50 için en az 200 mum gerekir, 250 ile warm-up payı bırakılır
 PREFILTER_TOP_N = 40
 
 EXCLUDED_SYMBOLS = [
@@ -83,7 +83,7 @@ def get_klines_df(client: Client, symbol: str) -> Optional[pd.DataFrame]:
             interval=KLINE_INTERVAL,
             limit=KLINE_LIMIT,
         )
-        if not raw or len(raw) < 30:
+        if not raw or len(raw) < 100:
             return None
 
         df = pd.DataFrame(

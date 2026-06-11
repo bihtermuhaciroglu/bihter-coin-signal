@@ -49,17 +49,16 @@ VERSION = "V4"
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, reply_markup: dict = None) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram kimlik bilgileri eksik.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        resp = requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": text},
-            timeout=15,
-        )
+        resp = requests.post(url, json=payload, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as exc:
         logger.error("Telegram gönderi hatası: %s", exc)
@@ -209,7 +208,17 @@ def send_buy_signals(new_signals: list, usdt_balance: float) -> None:
         ]
 
     lines.append("\n⚠️ Otomatik alım değildir. İşlem öncesi grafiği kontrol et.")
-    send_telegram("\n".join(lines))
+
+    # Her sinyal için ayrı inline buton satırı
+    buttons = []
+    for sig in new_signals:
+        buttons.append([
+            {"text": f"✅ {sig['symbol']} Aldım", "callback_data": f"bought_{sig['symbol']}"},
+            {"text": f"❌ Atladım", "callback_data": f"skip_{sig['symbol']}"},
+        ])
+
+    reply_markup = {"inline_keyboard": buttons}
+    send_telegram("\n".join(lines), reply_markup=reply_markup)
 
 
 # ---------------------------------------------------------------------------
