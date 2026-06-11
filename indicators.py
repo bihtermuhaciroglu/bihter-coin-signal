@@ -372,6 +372,24 @@ def score_coin(ticker: dict, btc_change: float, ind: dict) -> Optional[dict]:
     }
 
 
+def get_4h_trend(client: Client, symbol: str) -> int:
+    """
+    4H EMA20/50 trendini kontrol eder.
+    +1 = yukarı trend, -1 = aşağı trend, 0 = belirsiz
+    """
+    try:
+        raw = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_4HOUR, limit=60)
+        if not raw or len(raw) < 55:
+            return 0
+        closes = pd.Series([float(r[4]) for r in raw])
+        ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50 = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+        del closes, raw
+        return 1 if ema20 > ema50 else -1
+    except Exception:
+        return 0
+
+
 def analyze_candidates(
     client: Client,
     candidates: list[str],
@@ -379,9 +397,11 @@ def analyze_candidates(
     btc_change: float,
 ) -> list[dict]:
     """
-    Her aday coin için kline çeker, indikatör hesaplar, skorlar.
-    İstekler arası KLINE_REQUEST_DELAY beklenerek rate limit korunur.
-    Her DataFrame işlendikten hemen sonra silinerek bellek korunur.
+    Her aday coin için:
+      1) 1H kline + indikatörler hesaplanır
+      2) 4H trend onayı alınır (4H EMA20 > EMA50 olmalı)
+      3) Her ikisi de olumlu ise skor listeye eklenir
+    Bellek: her DataFrame işlendikten hemen sonra silinir.
     """
     results = []
     freshness_logged = False
@@ -392,12 +412,10 @@ def analyze_candidates(
             continue
 
         df = get_klines_df(client, symbol)
-        time.sleep(KLINE_REQUEST_DELAY)  # Binance rate limit marjı
+        time.sleep(KLINE_REQUEST_DELAY)
 
-        # İlk coin için veri tazeliğini bir kez logla
         if df is not None and not freshness_logged:
-            last_candle_ago = len(df) - 1  # son index = en güncel mum
-            logger.debug("Veri tazeliği: %s son mum index=%d (%d mum çekildi)", symbol, last_candle_ago, len(df))
+            logger.debug("Veri tazeliği: %s, %d mum çekildi", symbol, len(df))
             freshness_logged = True
 
         if df is None:
@@ -410,8 +428,21 @@ def analyze_candidates(
         if ind is None:
             continue
 
+        # 4H trend onayı — aşağı trendde sinyal üretme
+        trend_4h = get_4h_trend(client, symbol)
+        time.sleep(KLINE_REQUEST_DELAY)
+        if trend_4h == -1:
+            logger.debug("%s 4H trend aşağı, atlandı.", symbol)
+            continue
+
         coin = score_coin(ticker, btc_change, ind)
         if coin:
+            # 4H trend bonusu: yukarı trendse skora +5
+            if trend_4h == 1:
+                coin["score"] = min(100, coin["score"] + 5)
+                coin["trend_4h"] = "↑ 4H YUKARI"
+            else:
+                coin["trend_4h"] = "→ 4H NÖTR"
             results.append(coin)
 
     results.sort(key=lambda x: x["score"], reverse=True)

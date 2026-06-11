@@ -35,24 +35,27 @@ CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
-SCAN_INTERVAL = 300         # 5 dakika
-REPORT_INTERVAL = 3600      # 1 saat
-SIGNAL_COOLDOWN_HOURS = 2   # Aynı coin için minimum bekleme (skor ciddi artmadıkça)
-SIGNAL_RESEND_SCORE_DELTA = 6  # Cooldown içinde yeniden göndermek için gereken skor artışı
+SCAN_INTERVAL = 300           # 5 dakika
+REPORT_INTERVAL = 3600        # 1 saat
+SIGNAL_COOLDOWN_HOURS = 6     # Aynı coin için minimum bekleme
+SIGNAL_RESEND_SCORE_DELTA = 8 # Cooldown içinde yeniden göndermek için gereken skor artışı
 MIN_VOLUME_USDT = 10_000_000
 STATE_FILE = "state.json"
 
-MAX_NEW_SIGNALS = 5          # Tek mesajda max sinyal sayısı
-MIN_BUY_SCORE = 70          # 70+ takibe değer / 75+ güçlü / 80+ çok güçlü
+MAX_NEW_SIGNALS = 5            # Tek mesajda max sinyal sayısı
+MIN_BUY_SCORE = 82             # Sadece gerçekten güçlü sinyaller
 
 # Render Environment Variables'tan opsiyonel olarak set et:
 # PORTFOLIO_SIZE_USDT=182  → gerçek bakiye düşükse bunu kullan
 _env_portfolio = os.getenv("PORTFOLIO_SIZE_USDT")
 PORTFOLIO_SIZE_USDT = float(_env_portfolio) if _env_portfolio else None
 
-STOP_LOSS_PCT = 0.03        # Stop zararı %3
-TARGET1_PCT = 0.04          # Hedef 1 %4
-TARGET2_PCT = 0.08          # Hedef 2 %8
+STOP_LOSS_PCT = 0.045          # Stop %4.5 — küçük dalgalanmada stop yemez
+TARGET1_PCT = 0.06             # Hedef 1 %6
+TARGET2_PCT = 0.13             # Hedef 2 %13
+
+BTC_PAUSE_THRESHOLD = -2.0     # BTC bu kadar düşünce yeni sinyal gönderme
+BTC_STRONG_MARKET = 1.5        # BTC bu kadar artınca piyasa sağlıklı
 
 MAX_CLOSED_SIGNALS = 50
 MAX_SIGNAL_HISTORY = 100
@@ -783,17 +786,23 @@ def run_bot() -> None:
             # Aktif sinyal güncelleme
             check_active_signals(state, tickers_map)
 
-            # Yeni al sinyalleri
+            # BTC piyasa rejim filtresi — BTC düşerken yeni sinyal gönderme
+            market_paused = btc_change < BTC_PAUSE_THRESHOLD
+            if market_paused:
+                logger.info("Piyasa durduruldu: BTC 24s %.2f%% (eşik: %.1f%%)", btc_change, BTC_PAUSE_THRESHOLD)
+
+            # Yeni al sinyalleri (BTC düşerken üretme)
             new_signals: list = []
-            for coin in scored:
-                if coin["score"] < MIN_BUY_SCORE:
-                    break
-                if should_send_new_signal(coin["symbol"], coin["score"], state, balances):
-                    signal = create_signal(coin, effective_usdt)
-                    state["signals"][coin["symbol"]] = signal
-                    new_signals.append(signal)
-                if len(new_signals) >= MAX_NEW_SIGNALS:
-                    break
+            if not market_paused:
+                for coin in scored:
+                    if coin["score"] < MIN_BUY_SCORE:
+                        break
+                    if should_send_new_signal(coin["symbol"], coin["score"], state, balances):
+                        signal = create_signal(coin, effective_usdt)
+                        state["signals"][coin["symbol"]] = signal
+                        new_signals.append(signal)
+                    if len(new_signals) >= MAX_NEW_SIGNALS:
+                        break
 
             if new_signals:
                 send_buy_signals(new_signals, usdt_balance, effective_usdt)
