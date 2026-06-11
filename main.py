@@ -2,6 +2,7 @@ import gc
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -29,17 +30,21 @@ CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
-SCAN_INTERVAL = 300
-REPORT_INTERVAL = 3600
-SIGNAL_COOLDOWN_HOURS = 12
+SCAN_INTERVAL = 300         # 5 dakika
+REPORT_INTERVAL = 3600      # 1 saat
+SIGNAL_COOLDOWN_HOURS = 2   # Aynı coin için minimum bekleme (skor ciddi artmadıkça)
+SIGNAL_RESEND_SCORE_DELTA = 6  # Cooldown içinde yeniden göndermek için gereken skor artışı
 MIN_VOLUME_USDT = 10_000_000
 STATE_FILE = "state.json"
-MAX_NEW_SIGNALS = 3
-MIN_BUY_SCORE = 82
 
-# Kapalı sinyaller en fazla bu kadar tutulur (bellek sınırı)
+MAX_NEW_SIGNALS = 3
+MIN_BUY_SCORE = 70          # 70+ takibe değer / 75+ güçlü / 80+ çok güçlü
+
+STOP_LOSS_PCT = 0.03        # Stop zararı %3
+TARGET1_PCT = 0.04          # Hedef 1 %4
+TARGET2_PCT = 0.08          # Hedef 2 %8
+
 MAX_CLOSED_SIGNALS = 50
-# Aktif sinyal geçmişi en fazla bu kadar entry tutar
 MAX_SIGNAL_HISTORY = 100
 
 VERSION = "V4"
@@ -86,24 +91,19 @@ def save_state(state: dict) -> None:
 
 
 def _prune_state(state: dict) -> None:
-    """Kapalı sinyalleri ve eski girişleri silerek state büyümesini önler."""
     closed = state.get("closed", [])
     if len(closed) > MAX_CLOSED_SIGNALS:
         state["closed"] = closed[-MAX_CLOSED_SIGNALS:]
 
     signals = state.get("signals", {})
     if len(signals) > MAX_SIGNAL_HISTORY:
-        sorted_items = sorted(
-            signals.items(),
-            key=lambda kv: kv[1].get("time", ""),
-        )
-        to_remove = len(signals) - MAX_SIGNAL_HISTORY
-        for symbol, _ in sorted_items[:to_remove]:
+        sorted_items = sorted(signals.items(), key=lambda kv: kv[1].get("time", ""))
+        for symbol, _ in sorted_items[: len(signals) - MAX_SIGNAL_HISTORY]:
             del signals[symbol]
 
 
 # ---------------------------------------------------------------------------
-# Binance veri çekme
+# Binance veri
 # ---------------------------------------------------------------------------
 
 def get_balances(client: Client) -> dict:
@@ -130,7 +130,42 @@ def get_tickers_map(client: Client) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Sinyal mantığı
+# Pozisyon boyutu (risk-bazlı)
+# ---------------------------------------------------------------------------
+
+def position_size(usdt_balance: float, score: int) -> dict:
+    """
+    Risk-bazlı pozisyon hesabı.
+    Stop %3 varsayılarak, portföye olan risk yüzdesi de gösterilir.
+
+    Tier eşikleri:
+        80+  → bakiyenin %15'i
+        75+  → bakiyenin %10'u
+        70+  → bakiyenin %5'i
+    """
+    if usdt_balance <= 0 or score < MIN_BUY_SCORE:
+        return {"amount": 0.0, "alloc_pct": 0, "portfolio_risk_pct": 0.0}
+
+    if score >= 80:
+        alloc_pct = 0.15
+    elif score >= 75:
+        alloc_pct = 0.10
+    else:
+        alloc_pct = 0.05
+
+    amount = round(usdt_balance * alloc_pct, 2)
+    max_loss = round(amount * STOP_LOSS_PCT, 2)
+    portfolio_risk = round((max_loss / usdt_balance) * 100, 2) if usdt_balance > 0 else 0.0
+
+    return {
+        "amount": amount,
+        "alloc_pct": int(alloc_pct * 100),
+        "portfolio_risk_pct": portfolio_risk,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Spam önleme
 # ---------------------------------------------------------------------------
 
 def should_send_new_signal(
@@ -138,87 +173,81 @@ def should_send_new_signal(
 ) -> bool:
     asset = symbol.replace("USDT", "")
     if asset in balances and balances[asset] > 0:
-        return False
+        return False  # Zaten sahip olduğun coini tekrar önermez
 
     existing = state["signals"].get(symbol)
     if existing:
         last_time = datetime.fromisoformat(existing["time"])
-        if datetime.utcnow() - last_time < timedelta(hours=SIGNAL_COOLDOWN_HOURS):
-            if score < existing["score"] + 8:
-                return False
+        elapsed = datetime.utcnow() - last_time
+        if elapsed < timedelta(hours=SIGNAL_COOLDOWN_HOURS):
+            if score < existing["score"] + SIGNAL_RESEND_SCORE_DELTA:
+                return False  # Cooldown içinde, skor yeterince artmadı
     return True
 
 
-def position_size(usdt_balance: float, score: int) -> float:
-    if usdt_balance <= 0:
-        return 0.0
-    if score >= 95:
-        pct = 0.20
-    elif score >= 90:
-        pct = 0.15
-    elif score >= 82:
-        pct = 0.10
-    else:
-        pct = 0.0
-    return round(usdt_balance * pct, 2)
-
+# ---------------------------------------------------------------------------
+# Sinyal oluşturma
+# ---------------------------------------------------------------------------
 
 def create_signal(coin: dict, usdt_balance: float) -> dict:
     entry = coin["price"]
+    pos = position_size(usdt_balance, coin["score"])
     return {
         "symbol": coin["symbol"],
         "time": datetime.utcnow().isoformat(),
         "entry": entry,
-        "stop": round(entry * 0.97, 8),
-        "target1": round(entry * 1.04, 8),
-        "target2": round(entry * 1.08, 8),
+        "stop": round(entry * (1 - STOP_LOSS_PCT), 8),
+        "target1": round(entry * (1 + TARGET1_PCT), 8),
+        "target2": round(entry * (1 + TARGET2_PCT), 8),
         "score": coin["score"],
-        "amount": position_size(usdt_balance, coin["score"]),
+        "tier": coin.get("tier", ""),
+        "amount": pos["amount"],
+        "alloc_pct": pos["alloc_pct"],
+        "portfolio_risk_pct": pos["portfolio_risk_pct"],
         "status": "active",
         "rsi": coin.get("rsi", 0),
         "ema_trend": coin.get("ema_trend", "-"),
         "macd": coin.get("macd", "-"),
         "vol_spike": coin.get("vol_spike", 1.0),
+        "roc3": coin.get("roc3", 0.0),
     }
 
 
 def send_buy_signals(new_signals: list, usdt_balance: float) -> None:
     lines = [
-        f"🚀 AKILLI AL SİNYALİ — {VERSION}\n",
+        f"🚀 AL SİNYALİ — {VERSION}",
         f"💰 Spot USDT: {usdt_balance:.2f}\n",
     ]
 
     if usdt_balance == 0:
         lines.append(
-            "⚠️ USDT Spot cüzdanda 0 görünüyor. "
-            "Para Funding/Earn tarafındaysa Spot'a transfer et.\n"
+            "⚠️ USDT Spot cüzdanda 0. Para Funding/Earn'deyse Spot'a transfer et.\n"
         )
 
     for idx, sig in enumerate(new_signals, 1):
         ema_arrow = "↑" if "YUKARI" in sig.get("ema_trend", "") else "↓"
+        tier = sig.get("tier", "")
         lines += [
-            f"\n{idx}) {sig['symbol']}",
-            f"   Skor     : {sig['score']}/100",
-            f"   RSI      : {sig['rsi']}  |  EMA: {ema_arrow}  |  MACD: {sig['macd']}  |  Hacim: {sig['vol_spike']}x",
-            f"   Giriş    : {sig['entry']:.6f}",
-            f"   Tutar    : {sig['amount']} USDT",
-            f"   Stop     : {sig['stop']:.6f}",
-            f"   Hedef 1  : {sig['target1']:.6f}",
-            f"   Hedef 2  : {sig['target2']:.6f}",
+            f"{idx}) {sig['symbol']}  {tier}",
+            f"   Skor    : {sig['score']}/100",
+            f"   RSI     : {sig['rsi']}  |  EMA: {ema_arrow}  |  MACD: {sig['macd']}  |  Hacim: {sig['vol_spike']}x  |  ROC3: {sig['roc3']:+.1f}%",
+            f"   Giriş   : {sig['entry']:.6f}",
+            f"   Tutar   : {sig['amount']} USDT  (bakiyenin %{sig['alloc_pct']}'i | max risk: %{sig['portfolio_risk_pct']} portföy)",
+            f"   Stop    : {sig['stop']:.6f}",
+            f"   Hedef 1 : {sig['target1']:.6f}",
+            f"   Hedef 2 : {sig['target2']:.6f}\n",
         ]
 
-    lines.append("\n⚠️ Otomatik alım değildir. İşlem öncesi grafiği kontrol et.")
+    lines.append("⚠️ Otomatik alım değildir. İşlem öncesi grafiği kontrol et.")
 
-    # Her sinyal için ayrı inline buton satırı
     buttons = []
     for sig in new_signals:
         buttons.append([
             {"text": f"✅ {sig['symbol']} Aldım", "callback_data": f"bought_{sig['symbol']}"},
-            {"text": f"❌ Atladım", "callback_data": f"skip_{sig['symbol']}"},
+            {"text": "❌ Atladım", "callback_data": f"skip_{sig['symbol']}"},
         ])
 
-    reply_markup = {"inline_keyboard": buttons}
-    send_telegram("\n".join(lines), reply_markup=reply_markup)
+    send_telegram("\n".join(lines), reply_markup={"inline_keyboard": buttons})
 
 
 # ---------------------------------------------------------------------------
@@ -243,43 +272,58 @@ def check_active_signals(state: dict, tickers_map: dict) -> None:
 
         if price >= signal["target2"]:
             signal["status"] = "target2"
-            send_telegram(
-                f"🎯 HEDEF 2 GELDİ\n{symbol}\nKâr: %{pnl:.2f}"
-            )
+            send_telegram(f"🎯 HEDEF 2 GELDİ — {symbol}\nKâr: %{pnl:.2f}")
+
         elif price >= signal["target1"] and not signal.get("t1_sent"):
             signal["t1_sent"] = True
             send_telegram(
-                f"✅ HEDEF 1 GELDİ\n{symbol}\nKâr: %{pnl:.2f}\n"
-                "Kâr almayı değerlendirebilirsin."
+                f"✅ HEDEF 1 GELDİ — {symbol}\n"
+                f"Kâr: %{pnl:.2f}\n"
+                "Stop seviyeni girişe çekmeyi düşün. Kısmi kâr alınabilir."
             )
+
         elif price <= signal["stop"]:
             signal["status"] = "stopped"
-            send_telegram(
-                f"🛑 STOP SEVİYESİ\n{symbol}\nZarar: %{pnl:.2f}"
-            )
+            send_telegram(f"🛑 STOP TETİKLENDİ — {symbol}\nZarar: %{pnl:.2f}")
 
 
 # ---------------------------------------------------------------------------
-# Portföy raporu
+# Portföy rotasyon motoru
 # ---------------------------------------------------------------------------
 
-def portfolio_report(balances: dict, scored: list) -> None:
+def _rotation_action(score: int, pnl_pct: float = None) -> str:
+    """Skora ve PnL'e göre öneri etiketi üretir."""
+    if score >= 80:
+        return "✅ TUT"
+    elif score >= 75:
+        if pnl_pct is not None and pnl_pct > 5:
+            return "📈 STOP YÜKSELT"
+        return "👁 İZLE"
+    elif score >= 65:
+        if pnl_pct is not None and pnl_pct > 3:
+            return "💰 KÂR AL (kısmi)"
+        return "⚠️ POZİSYON AZALT"
+    else:
+        return "🔄 BAŞKA COİNE GEÇ"
+
+
+def portfolio_report(balances: dict, scored: list, state: dict = None) -> None:
     usdt = get_usdt_balance(balances)
     top3 = scored[:3]
 
     lines = [
-        f"📊 PORTFÖY RAPORU — {VERSION}\n",
+        f"📊 PORTFÖY RAPORU — {VERSION}",
         f"💰 Spot USDT: {usdt:.2f}\n",
         "🔥 En güçlü fırsatlar:",
     ]
 
     for idx, coin in enumerate(top3, 1):
         lines.append(
-            f"  {idx}) {coin['symbol']}  Skor: {coin['score']}/100  "
-            f"RSI: {coin['rsi']}  EMA: {coin['ema_trend']}  "
-            f"24s: %{coin['change']:.2f}"
+            f"  {idx}) {coin['symbol']}  {coin['tier']}  Skor: {coin['score']}/100  "
+            f"RSI: {coin['rsi']}  EMA: {coin['ema_trend']}  24s: %{coin['change']:.2f}"
         )
 
+    # Elindeki coinleri değerlendir
     holdings = []
     for asset, amount in balances.items():
         if asset == "USDT":
@@ -287,31 +331,41 @@ def portfolio_report(balances: dict, scored: list) -> None:
         sym = asset + "USDT"
         match = next((c for c in scored if c["symbol"] == sym), None)
         if match:
-            holdings.append({**match, "amount": amount})
+            # Bilinen sinyal varsa PnL hesapla
+            pnl_pct = None
+            if state:
+                sig = state.get("signals", {}).get(sym)
+                if sig and sig.get("entry", 0) > 0:
+                    current = match["price"]
+                    pnl_pct = ((current - sig["entry"]) / sig["entry"]) * 100
+
+            holdings.append({
+                **match,
+                "amount": amount,
+                "pnl_pct": pnl_pct,
+            })
 
     if holdings:
         holdings.sort(key=lambda x: x["score"], reverse=True)
         lines.append("\n📌 Elindeki coinler:")
+
         for h in holdings:
-            if h["score"] >= 80:
-                action = "TUT"
-            elif h["score"] >= 65:
-                action = "İZLE"
-            else:
-                action = "ZAYIF"
+            action = _rotation_action(h["score"], h.get("pnl_pct"))
+            pnl_str = f"  PnL: %{h['pnl_pct']:+.2f}" if h.get("pnl_pct") is not None else ""
             lines.append(
-                f"  - {h['symbol']}  {h['score']}/100  {action}  "
-                f"RSI: {h['rsi']}  24s: %{h['change']:.2f}"
+                f"  {action}  {h['symbol']}  {h['score']}/100  "
+                f"RSI: {h['rsi']}  EMA: {h['ema_trend']}  24s: %{h['change']:.2f}{pnl_str}"
             )
 
+        # Rotasyon önerisi: en zayıf coin ile en güçlü fırsat arasında büyük fark varsa
         weakest = holdings[-1]
         strongest = top3[0] if top3 else None
         if strongest and strongest["score"] - weakest["score"] >= 20:
             lines += [
                 "\n🔄 ROTASYON ÖNERİSİ",
-                f"  Zayıf : {weakest['symbol']} ({weakest['score']}/100)",
-                f"  Güçlü : {strongest['symbol']} ({strongest['score']}/100)",
-                f"  Öneri : {weakest['symbol']} pozisyonunun bir kısmını "
+                f"  Zayıf  : {weakest['symbol']} ({weakest['score']}/100)",
+                f"  Güçlü  : {strongest['symbol']} ({strongest['score']}/100  {strongest['tier']})",
+                f"  Öneri  : {weakest['symbol']} pozisyonunun bir kısmını "
                 f"{strongest['symbol']}'e taşımayı değerlendirebilirsin.",
             ]
     else:
@@ -322,13 +376,79 @@ def portfolio_report(balances: dict, scored: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /portfolio Telegram komutu (ayrı thread)
+# ---------------------------------------------------------------------------
+
+def start_command_listener(client: Client) -> None:
+    """
+    Telegram'dan gelen /portfolio komutunu polling ile dinler.
+    Daemon thread olarak çalışır, ana döngüyü bloklamamaz.
+    """
+
+    def _poll():
+        offset = 0
+        logger.info("Telegram komut dinleyici başlatıldı.")
+        while True:
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+                resp = requests.get(
+                    url,
+                    params={"offset": offset, "timeout": 25},
+                    timeout=30,
+                )
+                data = resp.json()
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    text = (msg.get("text") or "").strip()
+
+                    if text == "/portfolio":
+                        logger.info("/portfolio komutu alındı.")
+                        _handle_portfolio(client)
+
+            except Exception as exc:
+                logger.error("Telegram polling hatası: %s", exc)
+                time.sleep(10)
+
+    t = threading.Thread(target=_poll, daemon=True, name="telegram-listener")
+    t.start()
+
+
+def _handle_portfolio(client: Client) -> None:
+    """Anında portföy raporu üretip Telegram'a gönderir."""
+    try:
+        send_telegram("⏳ Portföy analiz ediliyor...")
+        state = load_state()
+        balances = get_balances(client)
+        tickers_map = get_tickers_map(client)
+
+        btc = tickers_map.get("BTCUSDT")
+        btc_change = safe_float(btc["priceChangePercent"]) if btc else 0.0
+
+        candidates = prefilter_candidates(tickers_map, MIN_VOLUME_USDT)
+        scored = analyze_candidates(client, candidates, tickers_map, btc_change)
+
+        portfolio_report(balances, scored, state)
+
+        del tickers_map, candidates, scored, balances
+        gc.collect()
+
+    except Exception as exc:
+        logger.exception("/portfolio hata: %s", exc)
+        send_telegram(f"⚠️ Portföy raporu hatası:\n{exc}")
+
+
+# ---------------------------------------------------------------------------
 # Ana döngü
 # ---------------------------------------------------------------------------
 
 def run_bot() -> None:
     client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-    send_telegram(f"✅ Bihter Coin Signal {VERSION} başladı.")
+    send_telegram(f"✅ Bihter Coin Signal {VERSION} başladı.\n"
+                  f"📌 /portfolio yazarak istediğin zaman portföy raporu alabilirsin.")
     logger.info("Bot %s başlatıldı.", VERSION)
+
+    start_command_listener(client)
 
     while True:
         try:
@@ -338,28 +458,31 @@ def run_bot() -> None:
             usdt_balance = get_usdt_balance(balances)
 
             tickers_map = get_tickers_map(client)
-
             btc = tickers_map.get("BTCUSDT")
             btc_change = safe_float(btc["priceChangePercent"]) if btc else 0.0
 
             logger.info(
-                "Tarama başladı — BTC 24s: %.2f%%  USDT bakiye: %.2f",
+                "Tarama — BTC 24s: %.2f%%  USDT: %.2f",
                 btc_change,
                 usdt_balance,
             )
 
-            # --- Birinci geçiş: hızlı ticker filtresi ---
+            # Birinci geçiş: ticker filtresi
             candidates = prefilter_candidates(tickers_map, MIN_VOLUME_USDT)
             logger.info("%d aday coin TA için seçildi.", len(candidates))
 
-            # --- İkinci geçiş: kline + indikatör skorlaması ---
+            # İkinci geçiş: kline + TA skorlama
             scored = analyze_candidates(client, candidates, tickers_map, btc_change)
-            logger.info("%d coin skorlandı. En yüksek: %s", len(scored), scored[:3] if scored else [])
+            logger.info(
+                "%d coin skorlandı. Top3: %s",
+                len(scored),
+                [(c["symbol"], c["score"]) for c in scored[:3]],
+            )
 
-            # --- Aktif sinyal güncelleme ---
+            # Aktif sinyal güncelleme
             check_active_signals(state, tickers_map)
 
-            # --- Yeni al sinyalleri ---
+            # Yeni al sinyalleri
             new_signals: list = []
             for coin in scored:
                 if coin["score"] < MIN_BUY_SCORE:
@@ -375,19 +498,18 @@ def run_bot() -> None:
                 send_buy_signals(new_signals, usdt_balance)
                 logger.info("%d yeni sinyal gönderildi.", len(new_signals))
 
-            # --- Saatlik rapor ---
+            # Saatlik portföy raporu
             now = time.time()
             if now - state.get("last_report", 0) >= REPORT_INTERVAL:
-                portfolio_report(balances, scored)
+                portfolio_report(balances, scored, state)
                 state["last_report"] = now
 
             save_state(state)
 
-            # --- Bellek temizliği ---
             del tickers_map, candidates, scored, balances, new_signals
             gc.collect()
 
-            logger.info("Tarama tamamlandı. Sonraki tarama %d saniye sonra.", SCAN_INTERVAL)
+            logger.info("Tarama tamamlandı. %d sn sonraki tarama.", SCAN_INTERVAL)
 
         except Exception as exc:
             logger.exception("Bot döngü hatası: %s", exc)
