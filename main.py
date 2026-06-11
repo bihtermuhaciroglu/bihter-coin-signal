@@ -396,14 +396,98 @@ def portfolio_report(balances: dict, scored: list, state: dict = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /portfolio Telegram komutu (ayrı thread)
+# Telegram komut dinleyici (polling)
 # ---------------------------------------------------------------------------
 
+COMMANDS_HELP = """📋 Kullanılabilir komutlar:
+
+/portfolio — Anlık portföy analizi ve rotasyon önerileri
+/bakiye    — Binance spot bakiyeni gösterir
+/sinyaller — Aktif açık sinyalleri listeler
+/durum     — Bot durumu ve son tarama bilgisi
+/yardim    — Bu listeyi gösterir"""
+
+_bot_state: dict = {"last_scan": None, "scan_count": 0}
+
+
 def start_command_listener(client: Client) -> None:
-    """
-    Telegram'dan gelen /portfolio komutunu polling ile dinler.
-    Daemon thread olarak çalışır, ana döngüyü bloklamamaz.
-    """
+    """Telegram mesajlarını ve callback query'leri polling ile dinler."""
+
+    def _answer_callback(callback_id: str, text: str = "") -> None:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text},
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+    def _handle_command(text: str, callback_id: str = None) -> None:
+        if text == "/portfolio":
+            logger.info("/portfolio komutu alındı.")
+            if callback_id:
+                _answer_callback(callback_id, "Analiz ediliyor...")
+            _handle_portfolio(client)
+
+        elif text == "/bakiye":
+            try:
+                balances = get_balances(client)
+                usdt = get_usdt_balance(balances)
+                eff = PORTFOLIO_SIZE_USDT or usdt
+                lines = [
+                    "💰 BAKİYE",
+                    f"Spot USDT : {usdt:.4f} USDT",
+                ]
+                if PORTFOLIO_SIZE_USDT:
+                    lines.append(f"Pozisyon  : {eff:.2f} USDT (manuel ayar)")
+                assets = [(a, v) for a, v in balances.items() if a != "USDT" and v > 0]
+                if assets:
+                    lines.append("\nDiğer varlıklar:")
+                    for asset, qty in assets:
+                        lines.append(f"  {asset}: {qty:.6f}")
+                send_telegram("\n".join(lines))
+            except Exception as exc:
+                send_telegram(f"⚠️ Bakiye hatası: {exc}")
+            if callback_id:
+                _answer_callback(callback_id)
+
+        elif text == "/sinyaller":
+            state = load_state()
+            active = {s: v for s, v in state["signals"].items() if v.get("status") == "active"}
+            if not active:
+                send_telegram("📭 Şu an aktif açık sinyal yok.")
+            else:
+                lines = [f"📡 AKTİF SİNYALLER ({len(active)} adet)\n"]
+                for sym, sig in active.items():
+                    lines.append(
+                        f"• {sym}  Skor:{sig['score']}  Giriş:{sig['entry']:.6f}"
+                        f"  Stop:{sig['stop']:.6f}  H1:{sig['target1']:.6f}"
+                    )
+                send_telegram("\n".join(lines))
+            if callback_id:
+                _answer_callback(callback_id)
+
+        elif text == "/durum":
+            state = load_state()
+            active_count = sum(1 for s in state["signals"].values() if s.get("status") == "active")
+            last = _bot_state.get("last_scan")
+            last_str = last.strftime("%H:%M:%S") if last else "Henüz yok"
+            send_telegram(
+                f"🤖 BOT DURUMU — {VERSION}\n\n"
+                f"Son tarama   : {last_str}\n"
+                f"Toplam tarama: {_bot_state['scan_count']}\n"
+                f"Aktif sinyal : {active_count}\n"
+                f"Tarama aralığı: {SCAN_INTERVAL}s\n"
+                f"Min skor     : {MIN_BUY_SCORE}"
+            )
+            if callback_id:
+                _answer_callback(callback_id)
+
+        elif text in ("/yardim", "/help", "/start"):
+            send_telegram(COMMANDS_HELP)
+            if callback_id:
+                _answer_callback(callback_id)
 
     def _poll():
         offset = 0
@@ -419,12 +503,25 @@ def start_command_listener(client: Client) -> None:
                 data = resp.json()
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
+
+                    # Normal mesaj komutları
                     msg = update.get("message", {})
                     text = (msg.get("text") or "").strip()
+                    if text.startswith("/"):
+                        _handle_command(text.split()[0])
 
-                    if text == "/portfolio":
-                        logger.info("/portfolio komutu alındı.")
-                        _handle_portfolio(client)
+                    # Inline buton callback'leri (✅ Aldım / ❌ Atladım)
+                    cb = update.get("callback_query", {})
+                    if cb:
+                        cb_data = cb.get("data", "")
+                        cb_id = cb.get("id", "")
+                        if cb_data.startswith("bought_"):
+                            sym = cb_data.replace("bought_", "")
+                            _answer_callback(cb_id, f"✅ {sym} alım kaydedildi!")
+                            send_telegram(f"✅ {sym} için alım onayladın. Başarılar!")
+                        elif cb_data.startswith("skip_"):
+                            sym = cb_data.replace("skip_", "")
+                            _answer_callback(cb_id, f"❌ {sym} atlandı.")
 
             except Exception as exc:
                 logger.error("Telegram polling hatası: %s", exc)
@@ -465,8 +562,10 @@ def _handle_portfolio(client: Client) -> None:
 
 def run_bot() -> None:
     client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-    send_telegram(f"✅ Bihter Coin Signal {VERSION} başladı.\n"
-                  f"📌 /portfolio yazarak istediğin zaman portföy raporu alabilirsin.")
+    send_telegram(
+        f"✅ Bihter Coin Signal {VERSION} başladı.\n\n"
+        + COMMANDS_HELP
+    )
     logger.info("Bot %s başlatıldı.", VERSION)
 
     start_command_listener(client)
@@ -531,6 +630,9 @@ def run_bot() -> None:
                 state["last_report"] = now
 
             save_state(state)
+
+            _bot_state["last_scan"] = datetime.now(timezone.utc).replace(tzinfo=None)
+            _bot_state["scan_count"] += 1
 
             del tickers_map, candidates, scored, balances, new_signals
             gc.collect()
