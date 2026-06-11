@@ -261,19 +261,17 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
         gain2_usd = round(amount * TARGET2_PCT, 2)
 
         lines = [
-            f"📢 AL SİNYALİ — {coin_name}",
-            f"{strength}",
-            "",
-            f"💵 Ne kadar al?  →  {amount} USDT",
-            f"📌 Alım fiyatı  →  {entry:.6f}",
-            "",
-            f"🛑 Zarar kes    →  {stop:.6f}  (−{risk_usd:.2f} USDT kaybedersin)",
-            f"🎯 1. Hedef     →  {t1:.6f}  (+{gain1_usd:.2f} USDT kazanırsın)",
-            f"🎯 2. Hedef     →  {t2:.6f}  (+{gain2_usd:.2f} USDT kazanırsın)",
-            "",
-            f"💡 Öneri: Alındıktan sonra stop-loss emirini borsa üzerinde {stop:.6f} fiyatına gir.",
-            "",
-            f"📊 Bakiyen: {usdt_balance:.2f} USDT  |  Bu işlem: %{sig['alloc_pct']} bakiyenden",
+            f"🚨 {coin_name} — AL SİNYALİ  {strength}",
+            f"━━━━━━━━━━━━━━━━━━━━━━",
+            f"",
+            f"✅ {entry:.6f} fiyatından AL",
+            f"   👉 {amount} USDT harca",
+            f"",
+            f"🛑 {stop:.6f} fiyatına düşerse SAT  (−{risk_usd:.2f} USDT)",
+            f"🎯 {t1:.6f} fiyatına gelince SAT  (+{gain1_usd:.2f} USDT) ← 1. hedef",
+            f"🚀 {t2:.6f} fiyatına gelince SAT  (+{gain2_usd:.2f} USDT) ← 2. hedef",
+            f"",
+            f"📊 Bakiyen: {usdt_balance:.2f} USDT  |  Bu işlem bakiyenin %{sig['alloc_pct']}'i",
         ]
 
         buttons = [[
