@@ -307,6 +307,9 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
         # Piyasa durumu kısa özet
         intel_line = market_intel.summary_text().split("\n")[0] if not market_intel.is_stale() else ""
 
+        t1_breakeven = round(entry * 1.00, 6)
+        t1_guarantee = round(entry * 1.05, 6)
+
         lines = [
             f"🚨 {coin_name} — AL SİNYALİ  {strength}",
             f"━━━━━━━━━━━━━━━━━━━━━━",
@@ -317,6 +320,10 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
             f"🛑 {stop:.6f} fiyatına düşerse SAT  (−{risk_usd:.2f} USDT)",
             f"🎯 {t1:.6f} fiyatına gelince SAT  (+{gain1_usd:.2f} USDT) ← 1. hedef",
             f"🚀 {t2:.6f} fiyatına gelince SAT  (+{gain2_usd:.2f} USDT) ← 2. hedef",
+            f"",
+            f"📈 HAREKETLİ STOP (otomatik):",
+            f"   %5 kârda  → stop {t1_breakeven:.6f}'e çıkar  (zarar etmezsin)",
+            f"   %10 kârda → stop {t1_guarantee:.6f}'e çıkar  (+%5 garanti)",
             f"",
             f"📊 Bakiyen: {usdt_balance:.2f} USDT  |  Bu işlem bakiyenin %{sig['alloc_pct']}'i",
         ]
@@ -350,20 +357,65 @@ def check_active_signals(state: dict, tickers_map: dict, client: Client = None) 
 
         pnl = ((price - entry) / entry) * 100
 
-        now_str = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-
+        now_str   = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         coin_name = symbol.replace("USDT", "")
         amount    = signal.get("amount", 0)
         pnl_usd   = round(amount * pnl / 100, 2)
 
-        # 1. Hedef geçildikten sonra stop'u giriş fiyatına otomatik yükselt (kârı koru)
-        if signal.get("t1_sent") and not signal.get("stop_raised") and price > signal["entry"]:
-            signal["stop"] = signal["entry"]
-            signal["stop_raised"] = True
+        # ── Hareketli Stop (Trailing Stop) ───────────────────────────────
+        #
+        #  Kâr %5+  → stop = giriş fiyatı       (zarar etmezsin)
+        #  Kâr %10+ → stop = giriş × 1.05        (en az %5 kâr garanti)
+        #  Kâr %13+ → stop = giriş × 1.08        (en az %8 kâr garanti)
+        #  Sonraki her %3 kârda stop +%2 yükselir (kârı takip eder)
+        #
+        new_stop = signal["stop"]
+
+        if pnl >= 13 and signal.get("trailing_level", 0) < 4:
+            new_stop = max(signal["stop"], round(entry * 1.08, 8))
+            if new_stop > signal["stop"]:
+                signal["trailing_level"] = 4
+        elif pnl >= 10 and signal.get("trailing_level", 0) < 3:
+            new_stop = max(signal["stop"], round(entry * 1.05, 8))
+            if new_stop > signal["stop"]:
+                signal["trailing_level"] = 3
+        elif pnl >= 5 and signal.get("trailing_level", 0) < 2:
+            new_stop = max(signal["stop"], round(entry * 1.00, 8))  # breakeven
+            if new_stop > signal["stop"]:
+                signal["trailing_level"] = 2
+        elif pnl >= 3 and signal.get("trailing_level", 0) < 1:
+            new_stop = max(signal["stop"], round(entry * 0.98, 8))  # zararı azalt
+            if new_stop > signal["stop"]:
+                signal["trailing_level"] = 1
+
+        # Dinamik trailing: %10+ kârdan sonra her %3'te stop %2 yukarı
+        if pnl >= 10:
+            dynamic_stop = round(entry * (1 + (pnl - 5) / 100 * 0.65), 8)
+            new_stop = max(new_stop, dynamic_stop)
+
+        # Stop yükseldiyse kaydet ve bildir
+        if new_stop > signal["stop"]:
+            old_stop  = signal["stop"]
+            signal["stop"]         = new_stop
+            signal["stop_raised"]  = True
+            guaranteed_pct = (new_stop - entry) / entry * 100
+            guaranteed_usd = round(amount * guaranteed_pct / 100, 2)
+            g_str = (
+                f"+{guaranteed_usd:.2f} USDT kâr garantilendi (%{guaranteed_pct:.1f})"
+                if guaranteed_pct > 0 else
+                "zarar sıfırlandı (breakeven)"
+            )
+            send_telegram(
+                f"📈 {coin_name} — HAREKETLİ STOP YÜKSELDİ\n\n"
+                f"Kâr    : %{pnl:.1f}  (+{pnl_usd:.2f} USDT)\n"
+                f"Eski stop : {old_stop:.6f}\n"
+                f"Yeni stop : {new_stop:.6f}  ← {g_str}"
+            )
+        # ─────────────────────────────────────────────────────────────────
 
         if price >= signal["target2"]:
             signal["status"] = "target2"
-            signal["time"] = now_str
+            signal["time"]   = now_str
             send_telegram(
                 f"🎯 {coin_name} — 2. HEDEFE ULAŞTI!\n\n"
                 f"Tüm pozisyonu sat — harika iş!\n"
@@ -374,16 +426,12 @@ def check_active_signals(state: dict, tickers_map: dict, client: Client = None) 
 
         elif price >= signal["target1"] and not signal.get("t1_sent"):
             signal["t1_sent"] = True
-            signal["stop"] = signal["entry"]
-            signal["stop_raised"] = True
             send_telegram(
                 f"✅ {coin_name} — 1. HEDEFE ULAŞTI!\n\n"
-                f"Yarısını sat, geri kalanı için stop-loss otomatik olarak giriş fiyatına çekildi.\n"
-                f"Artık kalan yarıda zarar etmezsin — sadece kazanabilirsin.\n"
+                f"Yarısını sat. Kalan yarı için hareketli stop devreye girdi — kâr korunuyor.\n"
                 f"💰 Şu anki kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
             )
             if client and AUTO_TRADE_ENABLED:
-                # Yarısını sat
                 qty = signal.get("auto_qty", 0)
                 if qty > 0:
                     half_qty = qty / 2
@@ -392,12 +440,18 @@ def check_active_signals(state: dict, tickers_map: dict, client: Client = None) 
 
         elif price <= signal["stop"]:
             signal["status"] = "stopped"
-            signal["time"] = now_str
-            if signal.get("stop_raised"):
+            signal["time"]   = now_str
+            level = signal.get("trailing_level", 0)
+            if level >= 3:
                 send_telegram(
-                    f"🔒 {coin_name} — POZİSYON KAPATILDI\n\n"
-                    f"1. hedef kârın zaten cebinde, kalan yarı giriş fiyatından çıktı.\n"
-                    f"Net sonuç: kârdaydın, zarar etmedin. ✅"
+                    f"🔒 {coin_name} — TRAILING STOP TETİKLENDİ\n\n"
+                    f"Hareketli stop sayesinde kârlı çıktın.\n"
+                    f"💰 Kilitli kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
+                )
+            elif level >= 2:
+                send_telegram(
+                    f"🔒 {coin_name} — BREAKEVEN ÇIKIŞI\n\n"
+                    f"Stop giriş fiyatına çekilmişti — zarar etmeden çıktın. ✅"
                 )
             else:
                 send_telegram(
