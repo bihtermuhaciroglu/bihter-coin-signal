@@ -31,7 +31,7 @@ from trader import (
     analyze_trade_history,
     format_analysis_report,
 )
-from learner import build_nightly_report
+from learner import build_nightly_report, market_intel
 
 load_dotenv()
 
@@ -79,6 +79,9 @@ AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE", "false").lower() == "true"
 
 # Gece öğrenme saati (UTC saat 21 = TR 00:00)
 NIGHTLY_LEARN_HOUR_UTC = 21
+
+# Piyasa zekası güncelleme aralığı (saniye)
+INTEL_REFRESH_INTERVAL = 1800  # 30 dakika
 
 # analyze_candidates eş zamanlı çalışmasını engeller (main loop + /portfolio)
 _analysis_lock = threading.Semaphore(1)
@@ -288,12 +291,18 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
         gain1_usd = round(amount * TARGET1_PCT, 2)
         gain2_usd = round(amount * TARGET2_PCT, 2)
 
+        intel_bonus = sig.get("intel_bonus", 0)
+        bonus_str   = f"  (piyasa zekası: {intel_bonus:+d})" if intel_bonus != 0 else ""
+
+        # Piyasa durumu kısa özet
+        intel_line = market_intel.summary_text().split("\n")[0] if not market_intel.is_stale() else ""
+
         lines = [
             f"🚨 {coin_name} — AL SİNYALİ  {strength}",
             f"━━━━━━━━━━━━━━━━━━━━━━",
             f"",
             f"✅ {entry:.6f} fiyatından AL",
-            f"   👉 {amount} USDT harca",
+            f"   👉 {amount} USDT harca{bonus_str}",
             f"",
             f"🛑 {stop:.6f} fiyatına düşerse SAT  (−{risk_usd:.2f} USDT)",
             f"🎯 {t1:.6f} fiyatına gelince SAT  (+{gain1_usd:.2f} USDT) ← 1. hedef",
@@ -301,6 +310,8 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
             f"",
             f"📊 Bakiyen: {usdt_balance:.2f} USDT  |  Bu işlem bakiyenin %{sig['alloc_pct']}'i",
         ]
+        if intel_line:
+            lines.append(intel_line)
 
         buttons = [[
             {"text": f"✅ Aldım", "callback_data": f"bought_{sig['symbol']}"},
@@ -776,17 +787,33 @@ def start_command_listener(client: Client) -> None:
 
         elif text == "/durum":
             state = load_state()
+            adaptive     = state.get("adaptive", {})
             active_count = sum(1 for s in state["signals"].values() if s.get("status") == "active")
-            last = _bot_state.get("last_scan")
-            last_str = last.strftime("%H:%M:%S") if last else "Henüz yok"
-            send_telegram(
-                f"🤖 BOT DURUMU — {VERSION}\n\n"
-                f"Son tarama   : {last_str}\n"
-                f"Toplam tarama: {_bot_state['scan_count']}\n"
-                f"Aktif sinyal : {active_count}\n"
-                f"Tarama aralığı: {SCAN_INTERVAL}s\n"
-                f"Min skor     : {MIN_BUY_SCORE}"
+            last         = _bot_state.get("last_scan")
+            last_str     = last.strftime("%H:%M:%S") if last else "Henüz yok"
+            sess         = get_active_session()
+            sess_str     = (
+                f"✅ Aktif ({sess.remaining_usdt:.0f} USDT kaldı, {sess.end_time.strftime('%H:%M')} bitiş)"
+                if sess else "❌ Yok"
             )
+            auto_str = "✅ AÇIK" if AUTO_TRADE_ENABLED else "❌ KAPALI (sinyal modu)"
+
+            lines = [
+                f"🤖 BOT DURUMU — {VERSION}",
+                f"",
+                f"Son tarama     : {last_str}",
+                f"Toplam tarama  : {_bot_state['scan_count']}",
+                f"Aktif sinyal   : {active_count}",
+                f"Otomatik işlem : {auto_str}",
+                f"Seans          : {sess_str}",
+                f"",
+                f"Min skor (dinamik) : {adaptive.get('min_score', MIN_BUY_SCORE)}",
+                f"Stop %  (dinamik)  : {adaptive.get('stop_pct', STOP_LOSS_PCT)*100:.1f}%",
+            ]
+            if not market_intel.is_stale():
+                lines.append("")
+                lines.append(market_intel.summary_text())
+            send_telegram("\n".join(lines))
             if callback_id:
                 _answer_callback(callback_id)
 
@@ -1286,6 +1313,11 @@ def run_bot() -> None:
 
     start_command_listener(client)
 
+    # İlk başlangıçta piyasa zekasını yükle (arka planda)
+    threading.Thread(
+        target=market_intel.refresh, args=(client,), daemon=True
+    ).start()
+
     while True:
         try:
             state = load_state()
@@ -1303,6 +1335,12 @@ def run_bot() -> None:
                     target=_run_nightly_learning,
                     args=(client, state),
                     daemon=True,
+                ).start()
+
+            # Piyasa zekası 30 dakikada bir güncelle (arka planda)
+            if market_intel.is_stale(max_age_minutes=30):
+                threading.Thread(
+                    target=market_intel.refresh, args=(client,), daemon=True
                 ).start()
 
             # Dinamik parametreler (öğrenme motorundan gelen)
@@ -1347,15 +1385,23 @@ def run_bot() -> None:
             new_signals: list = []
             if not market_paused:
                 for coin in scored:
-                    if coin["score"] < eff_min_score:
-                        break
-                    if should_send_new_signal(coin["symbol"], coin["score"], state, balances):
+                    # Piyasa zekası bonusunu ekle
+                    intel_bonus = market_intel.market_bonus(
+                        symbol=coin["symbol"],
+                        price_change=coin.get("change", 0),
+                    )
+                    adjusted_score = coin["score"] + intel_bonus
+
+                    if adjusted_score < eff_min_score:
+                        continue
+                    if should_send_new_signal(coin["symbol"], adjusted_score, state, balances):
+                        coin["score"] = adjusted_score   # güncellenmiş skoru kullan
                         signal = create_signal(coin, effective_usdt)
-                        # Dinamik stop kullan
                         entry = signal["entry"]
                         signal["stop"]    = round(entry * (1 - eff_stop_pct), 8)
                         signal["target1"] = round(entry * (1 + TARGET1_PCT), 8)
                         signal["target2"] = round(entry * (1 + TARGET2_PCT), 8)
+                        signal["intel_bonus"] = intel_bonus
 
                         state["signals"][coin["symbol"]] = signal
                         new_signals.append(signal)
