@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 
 import requests
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
 from indicators import (
@@ -48,6 +49,9 @@ MAX_CLOSED_SIGNALS = 50
 MAX_SIGNAL_HISTORY = 100
 
 VERSION = "V4"
+
+# analyze_candidates eş zamanlı çalışmasını engeller (main loop + /portfolio)
+_analysis_lock = threading.Semaphore(1)
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +430,8 @@ def _handle_portfolio(client: Client) -> None:
         btc_change = safe_float(btc["priceChangePercent"]) if btc else 0.0
 
         candidates = prefilter_candidates(tickers_map, MIN_VOLUME_USDT)
-        scored = analyze_candidates(client, candidates, tickers_map, btc_change)
+        with _analysis_lock:
+            scored = analyze_candidates(client, candidates, tickers_map, btc_change)
 
         portfolio_report(balances, scored, state)
 
@@ -471,8 +476,9 @@ def run_bot() -> None:
             candidates = prefilter_candidates(tickers_map, MIN_VOLUME_USDT)
             logger.info("%d aday coin TA için seçildi.", len(candidates))
 
-            # İkinci geçiş: kline + TA skorlama
-            scored = analyze_candidates(client, candidates, tickers_map, btc_change)
+            # İkinci geçiş: kline + TA skorlama (semaphore ile /portfolio ile çakışma önlenir)
+            with _analysis_lock:
+                scored = analyze_candidates(client, candidates, tickers_map, btc_change)
             logger.info(
                 "%d coin skorlandı. Top3: %s",
                 len(scored),
@@ -511,12 +517,23 @@ def run_bot() -> None:
 
             logger.info("Tarama tamamlandı. %d sn sonraki tarama.", SCAN_INTERVAL)
 
+        except BinanceAPIException as exc:
+            if exc.status_code == 429 or exc.status_code == 418:
+                wait = 65
+                logger.warning("Binance rate limit aşıldı, %ds bekleniyor.", wait)
+                send_telegram(f"⚠️ Binance istek limiti aşıldı. {wait} saniye bekleniyor...")
+                time.sleep(wait)
+            else:
+                logger.exception("Binance API hatası: %s", exc)
+                send_telegram(f"⚠️ {VERSION} Binance hatası:\n{exc}")
+                gc.collect()
+                time.sleep(SCAN_INTERVAL)
+
         except Exception as exc:
             logger.exception("Bot döngü hatası: %s", exc)
             send_telegram(f"⚠️ {VERSION} Bot hatası:\n{exc}")
             gc.collect()
-
-        time.sleep(SCAN_INTERVAL)
+            time.sleep(SCAN_INTERVAL)
 
 
 if __name__ == "__main__":

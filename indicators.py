@@ -1,5 +1,6 @@
 import gc
 import logging
+import time
 from typing import Optional
 
 import pandas as pd
@@ -12,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 KLINE_INTERVAL = Client.KLINE_INTERVAL_1HOUR
 KLINE_LIMIT = 250   # EMA50 için en az 200 mum gerekir; warm-up payıyla 250
-PREFILTER_TOP_N = 40
+PREFILTER_TOP_N = 30        # 40'tan 30'a düşürüldü — rate limit marjı
+KLINE_REQUEST_DELAY = 0.15  # Her kline isteği arası bekleme (saniye)
 
 EXCLUDED_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
@@ -378,6 +380,7 @@ def analyze_candidates(
 ) -> list[dict]:
     """
     Her aday coin için kline çeker, indikatör hesaplar, skorlar.
+    İstekler arası KLINE_REQUEST_DELAY beklenerek rate limit korunur.
     Her DataFrame işlendikten hemen sonra silinerek bellek korunur.
     """
     results = []
@@ -388,6 +391,8 @@ def analyze_candidates(
             continue
 
         df = get_klines_df(client, symbol)
+        time.sleep(KLINE_REQUEST_DELAY)  # Binance rate limit marjı
+
         if df is None:
             continue
 
