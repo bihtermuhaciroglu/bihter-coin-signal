@@ -384,6 +384,7 @@ def analyze_candidates(
     Her DataFrame işlendikten hemen sonra silinerek bellek korunur.
     """
     results = []
+    freshness_logged = False
 
     for symbol in candidates:
         ticker = tickers_map.get(symbol)
@@ -392,6 +393,12 @@ def analyze_candidates(
 
         df = get_klines_df(client, symbol)
         time.sleep(KLINE_REQUEST_DELAY)  # Binance rate limit marjı
+
+        # İlk coin için veri tazeliğini bir kez logla
+        if df is not None and not freshness_logged:
+            last_candle_ago = len(df) - 1  # son index = en güncel mum
+            logger.debug("Veri tazeliği: %s son mum index=%d (%d mum çekildi)", symbol, last_candle_ago, len(df))
+            freshness_logged = True
 
         if df is None:
             continue

@@ -38,8 +38,13 @@ SIGNAL_RESEND_SCORE_DELTA = 6  # Cooldown içinde yeniden göndermek için gerek
 MIN_VOLUME_USDT = 10_000_000
 STATE_FILE = "state.json"
 
-MAX_NEW_SIGNALS = 3
+MAX_NEW_SIGNALS = 5          # Tek mesajda max sinyal sayısı
 MIN_BUY_SCORE = 70          # 70+ takibe değer / 75+ güçlü / 80+ çok güçlü
+
+# Render Environment Variables'tan opsiyonel olarak set et:
+# PORTFOLIO_SIZE_USDT=182  → gerçek bakiye düşükse bunu kullan
+_env_portfolio = os.getenv("PORTFOLIO_SIZE_USDT")
+PORTFOLIO_SIZE_USDT = float(_env_portfolio) if _env_portfolio else None
 
 STOP_LOSS_PCT = 0.03        # Stop zararı %3
 TARGET1_PCT = 0.04          # Hedef 1 %4
@@ -217,15 +222,22 @@ def create_signal(coin: dict, usdt_balance: float) -> dict:
     }
 
 
-def send_buy_signals(new_signals: list, usdt_balance: float) -> None:
+def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: float = None) -> None:
+    eff = effective_usdt or usdt_balance
     lines = [
         f"🚀 AL SİNYALİ — {VERSION}",
-        f"💰 Spot USDT: {usdt_balance:.2f}\n",
+        f"💰 Spot USDT: {usdt_balance:.2f}",
     ]
 
-    if usdt_balance == 0:
+    if eff != usdt_balance:
+        lines.append(f"📐 Pozisyon hesabı: {eff:.2f} USDT üzerinden\n")
+    else:
+        lines.append("")
+
+    if usdt_balance < 10:
         lines.append(
-            "⚠️ USDT Spot cüzdanda 0. Para Funding/Earn'deyse Spot'a transfer et.\n"
+            f"⚠️ Spot bakiyen çok düşük ({usdt_balance:.2f} USDT). "
+            "Anlamlı işlem için en az 50 USDT önerilir.\n"
         )
 
     for idx, sig in enumerate(new_signals, 1):
@@ -274,8 +286,11 @@ def check_active_signals(state: dict, tickers_map: dict) -> None:
 
         pnl = ((price - entry) / entry) * 100
 
+        now_str = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
         if price >= signal["target2"]:
             signal["status"] = "target2"
+            signal["time"] = now_str   # cooldown sıfırla — hemen yeniden al sinyali gitmesin
             send_telegram(f"🎯 HEDEF 2 GELDİ — {symbol}\nKâr: %{pnl:.2f}")
 
         elif price >= signal["target1"] and not signal.get("t1_sent"):
@@ -288,6 +303,7 @@ def check_active_signals(state: dict, tickers_map: dict) -> None:
 
         elif price <= signal["stop"]:
             signal["status"] = "stopped"
+            signal["time"] = now_str   # cooldown sıfırla — stop'tan hemen sonra tekrar al gitmesin
             send_telegram(f"🛑 STOP TETİKLENDİ — {symbol}\nZarar: %{pnl:.2f}")
 
 
@@ -462,28 +478,32 @@ def run_bot() -> None:
             balances = get_balances(client)
             usdt_balance = get_usdt_balance(balances)
 
+            # Gerçek bakiye düşükse PORTFOLIO_SIZE_USDT env var'ı kullan
+            effective_usdt = PORTFOLIO_SIZE_USDT if PORTFOLIO_SIZE_USDT else usdt_balance
+
             tickers_map = get_tickers_map(client)
             btc = tickers_map.get("BTCUSDT")
             btc_change = safe_float(btc["priceChangePercent"]) if btc else 0.0
 
             logger.info(
-                "Tarama — BTC 24s: %.2f%%  USDT: %.2f",
-                btc_change,
-                usdt_balance,
+                "Tarama — BTC 24s: %.2f%%  Spot USDT: %.2f  Efektif: %.2f",
+                btc_change, usdt_balance, effective_usdt,
             )
 
             # Birinci geçiş: ticker filtresi
             candidates = prefilter_candidates(tickers_map, MIN_VOLUME_USDT)
             logger.info("%d aday coin TA için seçildi.", len(candidates))
 
-            # İkinci geçiş: kline + TA skorlama (semaphore ile /portfolio ile çakışma önlenir)
+            # İkinci geçiş: kline + TA skorlama
             with _analysis_lock:
                 scored = analyze_candidates(client, candidates, tickers_map, btc_change)
-            logger.info(
-                "%d coin skorlandı. Top3: %s",
-                len(scored),
-                [(c["symbol"], c["score"]) for c in scored[:3]],
-            )
+
+            if scored:
+                logger.info(
+                    "%d coin skorlandı. Top%d: %s",
+                    len(scored), min(3, len(scored)),
+                    [(c["symbol"], c["score"]) for c in scored[:3]],
+                )
 
             # Aktif sinyal güncelleme
             check_active_signals(state, tickers_map)
@@ -494,14 +514,14 @@ def run_bot() -> None:
                 if coin["score"] < MIN_BUY_SCORE:
                     break
                 if should_send_new_signal(coin["symbol"], coin["score"], state, balances):
-                    signal = create_signal(coin, usdt_balance)
+                    signal = create_signal(coin, effective_usdt)
                     state["signals"][coin["symbol"]] = signal
                     new_signals.append(signal)
                 if len(new_signals) >= MAX_NEW_SIGNALS:
                     break
 
             if new_signals:
-                send_buy_signals(new_signals, usdt_balance)
+                send_buy_signals(new_signals, usdt_balance, effective_usdt)
                 logger.info("%d yeni sinyal gönderildi.", len(new_signals))
 
             # Saatlik portföy raporu
