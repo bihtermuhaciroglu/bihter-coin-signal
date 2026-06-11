@@ -21,22 +21,20 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Simülasyon parametreleri
 # ---------------------------------------------------------------------------
-STARTING_BALANCE_TL   = 10_000.0
-TL_TO_USDT            = 0.0182          # 1 TL ≈ 0.0182 USDT (güncelle gerekirse)
-STARTING_BALANCE      = round(STARTING_BALANCE_TL * TL_TO_USDT, 2)  # ~182 USDT
+# ── Simülasyon ayarları (buradan değiştir) ───────────────────────────────
+STARTING_BALANCE  = 200.0        # Başlangıç bakiyesi (USDT)
+DAYS_BACK         = 2            # Kaç günlük geçmiş test edilsin
+MIN_SCORE         = 82           # Ana botla aynı eşik
+STOP_LOSS_PCT     = 0.045        # Ana botla aynı stop
+TARGET1_PCT       = 0.06         # Hedef 1
+TARGET2_PCT       = 0.13         # Hedef 2
+TOP_N_COINS       = 20
+WARMUP_CANDLES    = 250
+TZ_OFFSET_HOURS   = 3
 
-# ── EN İYİ SENARYO parametreleri ─────────────────────────────────────────
-MIN_SCORE        = 75           # Sadece güçlü sinyaller (75+)
-STOP_LOSS_PCT    = 0.025        # Stop %2.5
-TARGET1_PCT      = 0.05         # Hedef 1 %5
-TARGET2_PCT      = 0.12         # Hedef 2 %12
-TOP_N_COINS      = 20
-WARMUP_CANDLES   = 250
-TZ_OFFSET_HOURS  = 3
-
-ALLOC_SCORE_80   = 0.30         # 80+ skor → bakiyenin %30'u
-ALLOC_SCORE_75   = 0.20         # 75+ skor → bakiyenin %20'si
-MAX_OPEN_POS     = 3            # Aynı anda max 3 pozisyon
+ALLOC_SCORE_80    = 0.15         # 80+ → bakiyenin %15'i
+ALLOC_SCORE_75    = 0.10         # 75+ → bakiyenin %10'u
+MAX_OPEN_POS      = 3
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
@@ -101,20 +99,17 @@ def ticker_volume_24h(df: pd.DataFrame, idx: int) -> float:
 def run_simulation():
     client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
-    now_tr  = datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
-    sim_end = now_tr.replace(hour=21, minute=0, second=0, microsecond=0)
-    if sim_end > now_tr:
-        sim_end = now_tr
-    sim_start = now_tr.replace(hour=0, minute=0, second=0, microsecond=0)
-    hours_today = max(1, int((sim_end - sim_start).total_seconds() / 3600))
-    total_candles = WARMUP_CANDLES + hours_today
+    now_tr    = datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
+    sim_end   = now_tr
+    sim_start = now_tr - timedelta(days=DAYS_BACK)
+    total_hours   = max(1, int((sim_end - sim_start).total_seconds() / 3600))
+    total_candles = WARMUP_CANDLES + total_hours
 
     print(f"\n{'='*62}")
     print(f"  🚀  BİHETER COİN SİGNAL {'':<4} GÜNLÜK SİMÜLASYON")
     print(f"{'='*62}")
-    print(f"  Tarih      : {sim_start.strftime('%d %B %Y')} (Türkiye)")
-    print(f"  Süre       : 00:00 → {sim_end.strftime('%H:%M')}")
-    print(f"  Başlangıç  : {STARTING_BALANCE_TL:,.0f} TL  ≈  {STARTING_BALANCE:.2f} USDT")
+    print(f"  Tarih      : {sim_start.strftime('%d %b')} → {sim_end.strftime('%d %b %Y, %H:%M')} ({DAYS_BACK} gün)")
+    print(f"  Başlangıç  : {STARTING_BALANCE:.2f} USDT")
     print(f"  Min skor   : {MIN_SCORE}+")
     print(f"  Stop       : -%{STOP_LOSS_PCT*100:.0f}  |  Hedef1: +%{TARGET1_PCT*100:.0f}  |  Hedef2: +%{TARGET2_PCT*100:.0f}")
     print(f"{'='*62}\n")
@@ -139,7 +134,7 @@ def run_simulation():
     signals   = []
 
     print(f"{'─'*62}")
-    print(f"  Tarama: {len(symbols)} coin × {hours_today} saat")
+    print(f"  Tarama: {len(symbols)} coin × {total_hours} saat ({DAYS_BACK} gün)")
     print(f"{'─'*62}\n")
 
     for sym in symbols:
@@ -149,8 +144,8 @@ def run_simulation():
         time.sleep(0.15)
 
         for i in range(WARMUP_CANDLES, len(df)):
-            hour_idx = i - WARMUP_CANDLES   # 0 = bugün gece yarısı
-            if hour_idx >= hours_today:
+            hour_idx = i - WARMUP_CANDLES
+            if hour_idx >= total_hours:
                 break
 
             close_price = float(df["close"].iloc[i])
@@ -254,7 +249,7 @@ def run_simulation():
             "symbol": sym, "result": "⏰ AÇIK (gün sonu)",
             "profit": profit,
             "pct": (last_price - pos["entry"]) / pos["entry"] * 100,
-            "open_h": pos["open_hour"], "close_h": hours_today,
+            "open_h": pos["open_hour"], "close_h": total_hours,
         })
         del positions[sym]
 
@@ -270,11 +265,10 @@ def run_simulation():
     print(f"\n{'='*62}")
     print(f"  📊  SİMÜLASYON SONUÇLARI")
     print(f"{'='*62}")
-    tl_pnl  = round(total_pnl / TL_TO_USDT, 0)
     pnl_sign = "+" if total_pnl >= 0 else ""
     emoji = "🟢" if total_pnl >= 0 else "🔴"
-    print(f"  Başlangıç   : {STARTING_BALANCE_TL:>8,.0f} TL  ({STARTING_BALANCE:.2f} USDT)")
-    print(f"  Toplam PnL  : {emoji} {pnl_sign}{tl_pnl:>6,.0f} TL  ({pnl_sign}{total_pnl:.2f} USDT)  [{pnl_sign}{total_pnl_pct:.2f}%]")
+    print(f"  Başlangıç   : {STARTING_BALANCE:.2f} USDT")
+    print(f"  Toplam PnL  : {emoji} {pnl_sign}{total_pnl:.2f} USDT  [{pnl_sign}{total_pnl_pct:.2f}%]")
     print(f"{'─'*62}")
     print(f"  Toplam sinyal     : {len(signals)}")
     print(f"  Kapatılan işlem   : {len(closed)}")
