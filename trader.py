@@ -10,7 +10,7 @@ import logging
 import math
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException

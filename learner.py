@@ -14,7 +14,7 @@ learner.py — Piyasa zekası ve günlük öğrenme motoru  (V5)
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict
 
 import requests
 
@@ -75,7 +75,7 @@ def get_reddit_sentiment(limit: int = 25) -> Optional[dict]:
         "rug", "ban", "regulation", "lawsuit",
     ]
     scores    = []
-    mentions: dict[str, int] = {}
+    mentions: Dict[str, int] = {}
 
     for sub in _REDDIT_SUBS:
         try:
@@ -164,7 +164,7 @@ def get_news_sentiment() -> Optional[dict]:
 # 4. CoinGecko Trending Coins  (ücretsiz, auth yok)
 # ---------------------------------------------------------------------------
 
-def get_trending_coins() -> list[str]:
+def get_trending_coins() -> List[str]:
     """
     CoinGecko trending listesindeki coin sembollerini döner.
     ['SOLUSDT', 'SUIUSDT', ...]
@@ -188,7 +188,7 @@ def get_trending_coins() -> list[str]:
         return []
 
 
-def is_trending(symbol: str, trending: list[str]) -> bool:
+def is_trending(symbol: str, trending: List[str]) -> bool:
     return symbol in trending
 
 
@@ -196,7 +196,7 @@ def is_trending(symbol: str, trending: list[str]) -> bool:
 # 5. Binance Open Interest Değişimi  (ücretsiz Futures API)
 # ---------------------------------------------------------------------------
 
-def get_open_interest_changes(client, symbols: list[str]) -> dict[str, float]:
+def get_open_interest_changes(client, symbols: List[str]) -> Dict[str, float]:
     """
     Verilen futures sembollerinin 24 saatlik OI değişim yüzdelerini döner.
     {'BTCUSDT': +5.2, 'ETHUSDT': -1.3, ...}
@@ -294,9 +294,9 @@ class MarketIntelligence:
         self.fear_greed: Optional[dict]    = None
         self.reddit:     Optional[dict]    = None
         self.news:       Optional[dict]    = None
-        self.trending:   list[str]         = []
-        self.funding:    list[dict]        = []
-        self.oi_changes: dict[str, float]  = {}
+        self.trending:   List[str]         = []
+        self.funding:    List[dict]        = []
+        self.oi_changes: Dict[str, float]  = {}
         self.last_update: Optional[datetime] = None
         self._lock = __import__("threading").Lock()
 

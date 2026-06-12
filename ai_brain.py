@@ -15,7 +15,7 @@ import os
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import requests
 
@@ -99,7 +99,7 @@ class BTCPriceTracker:
     Son N fiyatı deque'da tutar — flash crash tespiti için kullanılır.
     """
     def __init__(self, maxlen: int = 20):
-        self.prices: deque[tuple[datetime, float]] = deque(maxlen=maxlen)
+        self.prices: deque = deque(maxlen=maxlen)
 
     def record(self, price: float) -> None:
         self.prices.append((datetime.now(timezone.utc).replace(tzinfo=None), price))
@@ -231,8 +231,8 @@ circuit_breaker = CircuitBreaker()
 # Oynayanlık (Volatility) Ölçer
 # ---------------------------------------------------------------------------
 
-def compute_atr_ratio(high_prices: list[float], low_prices: list[float],
-                       close_prices: list[float], period: int = 14) -> float:
+def compute_atr_ratio(high_prices: List[float], low_prices: List[float],
+                       close_prices: List[float], period: int = 14) -> float:
     """
     ATR / fiyat oranı döner — yüksekse piyasa çok oynak demek.
     > 0.03 (yüzde 3) → yüksek volatilite

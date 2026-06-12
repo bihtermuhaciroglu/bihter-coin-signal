@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import requests
 from binance.client import Client
@@ -1397,10 +1398,6 @@ def _run_nightly_learning(client: Client, state: dict) -> None:
     state["adaptive"]["stop_pct"]  = learning["new_stop_pct"]
     state["last_nightly"] = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d")
     save_state(state)
-
-
-# typing Optional için
-from typing import Optional
 
 
 def run_bot() -> None:
