@@ -716,6 +716,54 @@ def handle_free_text(text: str, client: Client) -> None:
     """Komut olmayan serbest metin mesajlarını anlar ve cevap üretir."""
     text_lower = text.lower()
 
+    # "Hepsini sat ve işlem yap" — elindeki coinleri USDT'ye çevirip seans başlat
+    sell_all_kw  = ["hepsini sat", "her şeyi sat", "coinleri sat", "hepsi sat", "sat ve işlem"]
+    if any(kw in text_lower for kw in sell_all_kw):
+        parsed = _parse_session_command(text)
+        end_time_str = ""
+        if parsed:
+            _, end_time = parsed
+            end_time_str = end_time.strftime('%H:%M')
+
+        send_telegram("⏳ Elindeki coinler USDT'ye çevriliyor...")
+        try:
+            balances = get_balances(client)
+            result   = sell_all_to_usdt(client, balances)
+            sold     = result["sold"]
+            skipped  = result["skipped"]
+
+            total_usdt = sum(s.get("proceeds", 0) for s in sold)
+            lines = ["✅ Tüm coinler satıldı:"]
+            for s in sold:
+                lines.append(f"  • {s['symbol'].replace('USDT','')} → {s['proceeds']:.2f} USDT")
+            if skipped:
+                lines.append(f"  ⚠️ Satılamayan: {', '.join(skipped)}")
+            lines.append(f"\n💵 Toplam USDT: ~{total_usdt:.2f}")
+            send_telegram("\n".join(lines))
+
+            # Seans başlat
+            if parsed:
+                _, end_time = parsed
+                fresh_bal  = get_balances(client)
+                fresh_usdt = get_usdt_balance(fresh_bal)
+                sess = start_session(fresh_usdt, end_time)
+                send_telegram(
+                    f"🚀 SEANS BAŞLATILDI\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💵 Bütçe      : {fresh_usdt:.2f} USDT\n"
+                    f"⏰ Bitiş saati: {end_time_str}\n\n"
+                    f"En iyi fırsatlarda otomatik alım/satım yapılacak.\n"
+                    f"Durdurmak için: /seansdurdur"
+                )
+            else:
+                send_telegram(
+                    "Seans başlatmak için saat de yaz:\n"
+                    "Örnek: *hepsini sat 18:00*"
+                )
+        except Exception as exc:
+            send_telegram(f"⚠️ Satış hatası: {exc}")
+        return
+
     # Seans başlatma: "90 usdt 21:00" veya "150 dolar 09:30 a kadar"
     if any(kw in text_lower for kw in ["usdt", "dolar", "$"]) and re.search(r"\d{1,2}[:.]\d{2}", text):
         parsed = _parse_session_command(text)
