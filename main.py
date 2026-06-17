@@ -74,8 +74,18 @@ _env_portfolio = os.getenv("PORTFOLIO_SIZE_USDT")
 PORTFOLIO_SIZE_USDT = float(_env_portfolio) if _env_portfolio else None
 
 STOP_LOSS_PCT = 0.045          # Stop %4.5 — küçük dalgalanmada stop yemez
-TARGET1_PCT = 0.06             # Hedef 1 %6
-TARGET2_PCT = 0.13             # Hedef 2 %13
+TARGET1_PCT = 0.06             # Hedef 1 %6 (sinyal modu)
+TARGET2_PCT = 0.13             # Hedef 2 %13 (sinyal modu)
+
+# Otomatik işlem modu — komisyon (~%0.2) sonrası net kâr için daha düşük hedefler
+AUTO_TARGET1_PCT = float(os.getenv("AUTO_TARGET1_PCT", "0.035"))   # %3.5
+AUTO_TARGET2_PCT = float(os.getenv("AUTO_TARGET2_PCT", "0.07"))    # %7
+QUICK_PROFIT_PCT = float(os.getenv("QUICK_PROFIT_PCT", "0.025"))   # %2.5 hızlı çık
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "3"))           # saat
+MIN_PROFIT_AFTER_HOLD = float(os.getenv("MIN_PROFIT_AFTER_HOLD", "0.012"))  # %1.2
+STALE_LOSS_HOURS = float(os.getenv("STALE_LOSS_HOURS", "4"))
+ROTATION_EXIT_SCORE = int(os.getenv("ROTATION_EXIT_SCORE", "68"))
+BINANCE_FEE_PCT = 0.001        # tek yön %0.1
 
 BTC_PAUSE_THRESHOLD = -2.0     # BTC bu kadar düşünce yeni sinyal gönderme
 BTC_STRONG_MARKET = 1.5        # BTC bu kadar artınca piyasa sağlıklı
@@ -247,16 +257,36 @@ def should_send_new_signal(
 # Sinyal oluşturma
 # ---------------------------------------------------------------------------
 
+def _target_pcts() -> tuple[float, float]:
+    """Otomatik işlemde daha düşük hedefler kullan."""
+    if AUTO_TRADE_ENABLED:
+        return AUTO_TARGET1_PCT, AUTO_TARGET2_PCT
+    return TARGET1_PCT, TARGET2_PCT
+
+
+def _effective_entry(signal: dict) -> float:
+    return signal.get("auto_price") or signal.get("entry") or 0.0
+
+
+def _apply_exit_levels(signal: dict, entry: float, stop_pct: float) -> None:
+    t1, t2 = _target_pcts()
+    signal["entry"] = entry
+    signal["stop"] = round(entry * (1 - stop_pct), 8)
+    signal["target1"] = round(entry * (1 + t1), 8)
+    signal["target2"] = round(entry * (1 + t2), 8)
+
+
 def create_signal(coin: dict, usdt_balance: float) -> dict:
     entry = coin["price"]
     pos = position_size(usdt_balance, coin["score"])
+    t1, t2 = _target_pcts()
     return {
         "symbol": coin["symbol"],
         "time": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "entry": entry,
         "stop": round(entry * (1 - STOP_LOSS_PCT), 8),
-        "target1": round(entry * (1 + TARGET1_PCT), 8),
-        "target2": round(entry * (1 + TARGET2_PCT), 8),
+        "target1": round(entry * (1 + t1), 8),
+        "target2": round(entry * (1 + t2), 8),
         "score": coin["score"],
         "tier": coin.get("tier", ""),
         "amount": pos["amount"],
@@ -342,7 +372,15 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
 # Aktif sinyal takibi
 # ---------------------------------------------------------------------------
 
-def check_active_signals(state: dict, tickers_map: dict, client: Client = None) -> None:
+def check_active_signals(
+    state: dict,
+    tickers_map: dict,
+    client: Client = None,
+    scored: list = None,
+) -> None:
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    score_map = {c["symbol"]: c for c in (scored or [])}
+
     for symbol, signal in list(state["signals"].items()):
         if signal.get("status") not in ("active",):
             continue
@@ -352,16 +390,68 @@ def check_active_signals(state: dict, tickers_map: dict, client: Client = None) 
             continue
 
         price = safe_float(ticker["lastPrice"])
-        entry = signal["entry"]
+        entry = _effective_entry(signal)
         if entry <= 0:
             continue
 
         pnl = ((price - entry) / entry) * 100
+        net_pnl = pnl - (BINANCE_FEE_PCT * 2 * 100)  # al+s sat komisyonu
 
-        now_str   = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        now_str   = now_dt.isoformat()
         coin_name = symbol.replace("USDT", "")
         amount    = signal.get("amount", 0)
         pnl_usd   = round(amount * pnl / 100, 2)
+
+        opened = datetime.fromisoformat(signal["time"])
+        hold_hours = (now_dt - opened).total_seconds() / 3600
+
+        # ── Zayıf sinyal / zaman aşımı çıkışları (otomatik mod) ──────────
+        if AUTO_TRADE_ENABLED and client:
+            coin_score = score_map.get(symbol, {}).get("score")
+            if coin_score is not None and coin_score < ROTATION_EXIT_SCORE and pnl < 1.5:
+                signal["status"] = "rotation"
+                signal["time"] = now_str
+                send_telegram(
+                    f"🔄 {coin_name} — ZAYIF GÖRÜNÜM, SATILIYOR\n\n"
+                    f"Skor düştü ({coin_score}/100), momentum zayıf.\n"
+                    f"PnL: {pnl_usd:+.2f} USDT (%{pnl:.1f})"
+                )
+                _auto_execute_sell(client, symbol, state, "rotation")
+                continue
+
+            if hold_hours >= STALE_LOSS_HOURS and pnl < -0.5:
+                signal["status"] = "stale_loss"
+                signal["time"] = now_str
+                send_telegram(
+                    f"⏰ {coin_name} — UZUN SÜRE EKSİDE, SATILIYOR\n\n"
+                    f"{hold_hours:.1f} saat geçti, hâlâ %{pnl:.1f}.\n"
+                    f"Parayı başka fırsata bırakıyoruz."
+                )
+                _auto_execute_sell(client, symbol, state, "stale_loss")
+                continue
+
+            if hold_hours >= MAX_HOLD_HOURS and net_pnl >= MIN_PROFIT_AFTER_HOLD * 100:
+                signal["status"] = "time_profit"
+                signal["time"] = now_str
+                send_telegram(
+                    f"⏰ {coin_name} — SÜRE DOLDU, KÂRLA SATILIYOR\n\n"
+                    f"{hold_hours:.1f} saat tutuldu.\n"
+                    f"Net kâr (komisyon sonrası): ~%{net_pnl:.1f}"
+                )
+                _auto_execute_sell(client, symbol, state, "time_profit")
+                continue
+
+            if net_pnl >= QUICK_PROFIT_PCT * 100 and not signal.get("quick_sold"):
+                signal["quick_sold"] = True
+                signal["status"] = "quick_profit"
+                signal["time"] = now_str
+                send_telegram(
+                    f"💰 {coin_name} — HIZLI KÂR ALINDI\n\n"
+                    f"%{pnl:.1f} yükseldi → komisyon sonrası net kâr kilitlendi.\n"
+                    f"Tahmini: +{pnl_usd:.2f} USDT"
+                )
+                _auto_execute_sell(client, symbol, state, "quick_profit")
+                continue
 
         # ── Hareketli Stop (Trailing Stop) ───────────────────────────────
         #
@@ -1319,6 +1409,11 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
             state["signals"][symbol]["auto_qty"]   = result["qty"]
             state["signals"][symbol]["auto_price"]  = result["avg_price"]
             state["signals"][symbol]["auto_cost"]   = result["cost"]
+            _apply_exit_levels(
+                state["signals"][symbol],
+                result["avg_price"],
+                STOP_LOSS_PCT,
+            )
             state["trades"].append({
                 **result,
                 "signal_score": signal["score"],
@@ -1343,6 +1438,11 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
             state["signals"][symbol]["auto_qty"]  = result["qty"]
             state["signals"][symbol]["auto_price"] = result["avg_price"]
             state["signals"][symbol]["auto_cost"]  = result["cost"]
+            _apply_exit_levels(
+                state["signals"][symbol],
+                result["avg_price"],
+                STOP_LOSS_PCT,
+            )
             state["trades"].append({
                 **result,
                 "signal_score": signal["score"],
@@ -1367,10 +1467,24 @@ def _auto_execute_sell(client: Client, symbol: str, state: dict, reason: str) ->
     if not AUTO_TRADE_ENABLED:
         return
     sig = state["signals"].get(symbol)
-    if not sig or not sig.get("auto_qty"):
+    if not sig:
         return
 
-    qty    = sig["auto_qty"]
+    qty = sig.get("auto_qty", 0)
+    if qty <= 0 and client:
+        try:
+            balances = get_balances(client)
+            asset = symbol.replace("USDT", "")
+            qty = balances.get(asset, 0)
+            if qty > 0:
+                sig["auto_qty"] = qty
+        except Exception as exc:
+            logger.error("auto_qty senkron hatası %s: %s", symbol, exc)
+
+    if qty <= 0:
+        logger.warning("Satış atlandı — miktar yok: %s", symbol)
+        return
+
     result = market_sell(client, symbol, qty)
     if result:
         entry    = sig.get("auto_price", sig["entry"])
@@ -1392,6 +1506,7 @@ def _auto_execute_sell(client: Client, symbol: str, state: dict, reason: str) ->
             f"{symbol.replace('USDT','')}  {result['avg_price']:.6f} fiyatından satıldı\n"
             f"{emoji} PnL: {pnl_usdt:+.2f} USDT"
         )
+        sig["auto_qty"] = 0
 
 
 def _check_session_expiry(client: Client, state: dict) -> None:
@@ -1551,7 +1666,7 @@ def run_bot() -> None:
                 logger.info("%d coin skorlandı. Top3: %s", len(scored),
                             [(c["symbol"], c["score"]) for c in scored[:3]])
 
-            check_active_signals(state, tickers_map, client)
+            check_active_signals(state, tickers_map, client, scored)
 
             market_paused = btc_change < BTC_PAUSE_THRESHOLD or not circuit_breaker.can_open_position()
             if market_paused:
@@ -1575,10 +1690,7 @@ def run_bot() -> None:
                     if should_send_new_signal(coin["symbol"], adjusted_score, state, balances):
                         coin["score"] = adjusted_score
                         signal = create_signal(coin, effective_usdt)
-                        entry = signal["entry"]
-                        signal["stop"]    = round(entry * (1 - eff_stop_pct), 8)
-                        signal["target1"] = round(entry * (1 + TARGET1_PCT), 8)
-                        signal["target2"] = round(entry * (1 + TARGET2_PCT), 8)
+                        _apply_exit_levels(signal, signal["entry"], eff_stop_pct)
                         signal["intel_bonus"] = intel_bonus
                         # Volatilite ayarı
                         signal["amount"] = round(signal["amount"] * cb_mult, 2)
