@@ -58,14 +58,15 @@ CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
-SCAN_INTERVAL = 300           # 5 dakika
+SCAN_INTERVAL = 180 if os.getenv("AUTO_TRADE", "false").lower() == "true" else 300
 REPORT_INTERVAL = 3600        # 1 saat
 SIGNAL_COOLDOWN_HOURS = 6     # Aynı coin için minimum bekleme
 SIGNAL_RESEND_SCORE_DELTA = 8 # Cooldown içinde yeniden göndermek için gereken skor artışı
-MIN_VOLUME_USDT = 10_000_000
+MIN_VOLUME_USDT = 400_000     # Momentum coinler — düşük hacimli ama likit
 STATE_FILE = "state.json"
 
-MAX_NEW_SIGNALS = 5            # Tek mesajda max sinyal sayısı
+MAX_NEW_SIGNALS = 2            # Aynı anda max 2 yeni alım
+MAX_OPEN_POSITIONS = 2         # Toplam açık pozisyon limiti
 MIN_BUY_SCORE = 82             # Sadece gerçekten güçlü sinyaller
 
 # Render Environment Variables'tan opsiyonel olarak set et:
@@ -73,18 +74,22 @@ MIN_BUY_SCORE = 82             # Sadece gerçekten güçlü sinyaller
 _env_portfolio = os.getenv("PORTFOLIO_SIZE_USDT")
 PORTFOLIO_SIZE_USDT = float(_env_portfolio) if _env_portfolio else None
 
-STOP_LOSS_PCT = 0.045          # Stop %4.5 — küçük dalgalanmada stop yemez
+STOP_LOSS_PCT = 0.045          # Stop %4.5 (sinyal modu)
+AUTO_STOP_LOSS_PCT = float(os.getenv("AUTO_STOP_LOSS_PCT", "0.025"))  # Otomatik: %2.5
 TARGET1_PCT = 0.06             # Hedef 1 %6 (sinyal modu)
 TARGET2_PCT = 0.13             # Hedef 2 %13 (sinyal modu)
 
 # Otomatik işlem modu — komisyon (~%0.2) sonrası net kâr için daha düşük hedefler
-AUTO_TARGET1_PCT = float(os.getenv("AUTO_TARGET1_PCT", "0.035"))   # %3.5
-AUTO_TARGET2_PCT = float(os.getenv("AUTO_TARGET2_PCT", "0.07"))    # %7
-QUICK_PROFIT_PCT = float(os.getenv("QUICK_PROFIT_PCT", "0.025"))   # %2.5 hızlı çık
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "3"))           # saat
-MIN_PROFIT_AFTER_HOLD = float(os.getenv("MIN_PROFIT_AFTER_HOLD", "0.012"))  # %1.2
-STALE_LOSS_HOURS = float(os.getenv("STALE_LOSS_HOURS", "4"))
-ROTATION_EXIT_SCORE = int(os.getenv("ROTATION_EXIT_SCORE", "68"))
+AUTO_TARGET1_PCT = float(os.getenv("AUTO_TARGET1_PCT", "0.025"))   # %2.5
+AUTO_TARGET2_PCT = float(os.getenv("AUTO_TARGET2_PCT", "0.05"))    # %5
+QUICK_PROFIT_PCT = float(os.getenv("QUICK_PROFIT_PCT", "0.018"))   # %1.8 hızlı çık
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "1.5"))         # 1.5 saat
+MIN_PROFIT_AFTER_HOLD = float(os.getenv("MIN_PROFIT_AFTER_HOLD", "0.008"))  # %0.8
+STALE_LOSS_HOURS = float(os.getenv("STALE_LOSS_HOURS", "1.5"))
+STALE_LOSS_PCT = float(os.getenv("STALE_LOSS_PCT", "-0.3"))        # %0.3 eksi = kes
+ROTATION_EXIT_SCORE = int(os.getenv("ROTATION_EXIT_SCORE", "72"))
+FLAT_EXIT_HOURS = float(os.getenv("FLAT_EXIT_HOURS", "0.75"))      # 45 dk yatay = çık
+FLAT_EXIT_MAX_PNL = float(os.getenv("FLAT_EXIT_MAX_PNL", "0.5"))   # %0.5 altı kâr
 BINANCE_FEE_PCT = 0.001        # tek yön %0.1
 
 BTC_PAUSE_THRESHOLD = -2.0     # BTC bu kadar düşünce yeni sinyal gönderme
@@ -264,6 +269,62 @@ def _target_pcts() -> tuple[float, float]:
     return TARGET1_PCT, TARGET2_PCT
 
 
+def _effective_stop_pct() -> float:
+    if AUTO_TRADE_ENABLED:
+        return AUTO_STOP_LOSS_PCT
+    return STOP_LOSS_PCT
+
+
+def _count_open_positions(state: dict, balances: dict) -> int:
+    """Aktif sinyal + bakiyede coin varsa say."""
+    seen = set()
+    for sym, sig in state.get("signals", {}).items():
+        if sig.get("status") == "active":
+            seen.add(sym)
+    for asset, qty in balances.items():
+        if asset != "USDT" and qty > 0:
+            seen.add(asset + "USDT")
+    return len(seen)
+
+
+def _sync_holdings_to_state(balances: dict, state: dict, tickers_map: dict) -> None:
+    """
+    Binance'deki coinleri state'e bağla — satış takibi kaçırılmasın.
+    Bot dışında alınmış veya kayıt düşmemiş pozisyonları izler.
+    """
+    now_str = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    for asset, qty in balances.items():
+        if asset == "USDT" or qty <= 0:
+            continue
+        symbol = asset + "USDT"
+        ticker = tickers_map.get(symbol)
+        if not ticker:
+            continue
+        price = safe_float(ticker["lastPrice"])
+        sig = state["signals"].get(symbol)
+        if sig and sig.get("status") == "active":
+            if not sig.get("auto_qty") or sig["auto_qty"] <= 0:
+                sig["auto_qty"] = qty
+            continue
+        # Kayıtsız pozisyon — takibe al
+        state["signals"][symbol] = {
+            "symbol": symbol,
+            "status": "active",
+            "time": now_str,
+            "entry": price,
+            "auto_price": price,
+            "auto_qty": qty,
+            "auto_cost": qty * price,
+            "amount": round(qty * price, 2),
+            "score": 0,
+            "orphan": True,
+            "stop": round(price * (1 - _effective_stop_pct()), 8),
+            "target1": round(price * (1 + _target_pcts()[0]), 8),
+            "target2": round(price * (1 + _target_pcts()[1]), 8),
+        }
+        logger.info("Kayıtsız pozisyon takibe alındı: %s qty=%.6f", symbol, qty)
+
+
 def _effective_entry(signal: dict) -> float:
     return signal.get("auto_price") or signal.get("entry") or 0.0
 
@@ -279,12 +340,13 @@ def _apply_exit_levels(signal: dict, entry: float, stop_pct: float) -> None:
 def create_signal(coin: dict, usdt_balance: float) -> dict:
     entry = coin["price"]
     pos = position_size(usdt_balance, coin["score"])
+    stop_pct = _effective_stop_pct()
     t1, t2 = _target_pcts()
     return {
         "symbol": coin["symbol"],
         "time": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         "entry": entry,
-        "stop": round(entry * (1 - STOP_LOSS_PCT), 8),
+        "stop": round(entry * (1 - stop_pct), 8),
         "target1": round(entry * (1 + t1), 8),
         "target2": round(entry * (1 + t2), 8),
         "score": coin["score"],
@@ -408,7 +470,20 @@ def check_active_signals(
         # ── Zayıf sinyal / zaman aşımı çıkışları (otomatik mod) ──────────
         if AUTO_TRADE_ENABLED and client:
             coin_score = score_map.get(symbol, {}).get("score")
-            if coin_score is not None and coin_score < ROTATION_EXIT_SCORE and pnl < 1.5:
+
+            # Yatay piyasa — 45 dk geçti, kâr yok → sat, parayı serbest bırak
+            if hold_hours >= FLAT_EXIT_HOURS and -0.5 <= pnl <= FLAT_EXIT_MAX_PNL:
+                signal["status"] = "flat_exit"
+                signal["time"] = now_str
+                send_telegram(
+                    f"📤 {coin_name} — YATAY, SATILIYOR\n\n"
+                    f"{hold_hours:.1f} saat geçti, fiyat neredeyse aynı (%{pnl:.1f}).\n"
+                    f"Başka fırsata geçiyoruz."
+                )
+                _auto_execute_sell(client, symbol, state, "flat_exit")
+                continue
+
+            if coin_score is not None and coin_score < ROTATION_EXIT_SCORE and pnl < 2.0:
                 signal["status"] = "rotation"
                 signal["time"] = now_str
                 send_telegram(
@@ -419,13 +494,13 @@ def check_active_signals(
                 _auto_execute_sell(client, symbol, state, "rotation")
                 continue
 
-            if hold_hours >= STALE_LOSS_HOURS and pnl < -0.5:
+            if hold_hours >= STALE_LOSS_HOURS and pnl <= STALE_LOSS_PCT:
                 signal["status"] = "stale_loss"
                 signal["time"] = now_str
                 send_telegram(
-                    f"⏰ {coin_name} — UZUN SÜRE EKSİDE, SATILIYOR\n\n"
-                    f"{hold_hours:.1f} saat geçti, hâlâ %{pnl:.1f}.\n"
-                    f"Parayı başka fırsata bırakıyoruz."
+                    f"⏰ {coin_name} — EKSİDE KALDI, SATILIYOR\n\n"
+                    f"{hold_hours:.1f} saat geçti, %{pnl:.1f}.\n"
+                    f"Zararı büyütmeden çıkıyoruz."
                 )
                 _auto_execute_sell(client, symbol, state, "stale_loss")
                 continue
@@ -517,17 +592,19 @@ def check_active_signals(
 
         elif price >= signal["target1"] and not signal.get("t1_sent"):
             signal["t1_sent"] = True
+            signal["status"] = "target1"
+            signal["time"] = now_str
             send_telegram(
-                f"✅ {coin_name} — 1. HEDEFE ULAŞTI!\n\n"
-                f"Yarısını sat. Kalan yarı için hareketli stop devreye girdi — kâr korunuyor.\n"
-                f"💰 Şu anki kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
+                f"✅ {coin_name} — 1. HEDEFE ULAŞTI, SATILIYOR\n\n"
+                f"💰 Kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
             )
             if client and AUTO_TRADE_ENABLED:
+                _auto_execute_sell(client, symbol, state, "target1")
+            elif client:
                 qty = signal.get("auto_qty", 0)
                 if qty > 0:
-                    half_qty = qty / 2
-                    market_sell(client, symbol, half_qty)
-                    signal["auto_qty"] = qty - half_qty
+                    market_sell(client, symbol, qty / 2)
+                    signal["auto_qty"] = qty / 2
 
         elif price <= signal["stop"]:
             signal["status"] = "stopped"
@@ -1412,7 +1489,7 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
             _apply_exit_levels(
                 state["signals"][symbol],
                 result["avg_price"],
-                STOP_LOSS_PCT,
+                _effective_stop_pct(),
             )
             state["trades"].append({
                 **result,
@@ -1441,7 +1518,7 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
             _apply_exit_levels(
                 state["signals"][symbol],
                 result["avg_price"],
-                STOP_LOSS_PCT,
+                _effective_stop_pct(),
             )
             state["trades"].append({
                 **result,
@@ -1656,19 +1733,29 @@ def run_bot() -> None:
                 cb_state, drawdown, usdt_balance,
             )
 
-            candidates = prefilter_candidates(tickers_map, MIN_VOLUME_USDT)
-            logger.info("%d aday coin TA için seçildi.", len(candidates))
+            candidates = prefilter_candidates(
+                tickers_map,
+                MIN_VOLUME_USDT,
+                trending=getattr(market_intel, "trending", []) or [],
+            )
+            logger.info("%d momentum aday coin seçildi.", len(candidates))
 
             with _analysis_lock:
                 scored = analyze_candidates(client, candidates, tickers_map, btc_change)
 
             if scored:
                 logger.info("%d coin skorlandı. Top3: %s", len(scored),
-                            [(c["symbol"], c["score"]) for c in scored[:3]])
+                            [(c["symbol"], c["score"], f"{c['change']:.1f}%") for c in scored[:3]])
 
+            # Bakiyedeki tüm coinleri takibe al, sonra satış kontrolü
+            _sync_holdings_to_state(balances, state, tickers_map)
             check_active_signals(state, tickers_map, client, scored)
 
             market_paused = btc_change < BTC_PAUSE_THRESHOLD or not circuit_breaker.can_open_position()
+            open_positions = _count_open_positions(state, balances)
+            if open_positions >= MAX_OPEN_POSITIONS:
+                logger.info("Max açık pozisyon (%d/%d), yeni alım kapalı.",
+                            open_positions, MAX_OPEN_POSITIONS)
             if market_paused:
                 logger.info("Piyasa durduruldu: BTC %.2f%%  CB:%s", btc_change, cb_state)
 
@@ -1676,7 +1763,7 @@ def run_bot() -> None:
             cb_mult = circuit_breaker.position_size_multiplier()
 
             new_signals: list = []
-            if not market_paused:
+            if not market_paused and open_positions < MAX_OPEN_POSITIONS:
                 for coin in scored:
                     # Piyasa zekası bonusunu ekle
                     intel_bonus = market_intel.market_bonus(
@@ -1690,7 +1777,7 @@ def run_bot() -> None:
                     if should_send_new_signal(coin["symbol"], adjusted_score, state, balances):
                         coin["score"] = adjusted_score
                         signal = create_signal(coin, effective_usdt)
-                        _apply_exit_levels(signal, signal["entry"], eff_stop_pct)
+                        _apply_exit_levels(signal, signal["entry"], eff_stop_pct if not AUTO_TRADE_ENABLED else _effective_stop_pct())
                         signal["intel_bonus"] = intel_bonus
                         # Volatilite ayarı
                         signal["amount"] = round(signal["amount"] * cb_mult, 2)

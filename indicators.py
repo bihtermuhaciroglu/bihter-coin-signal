@@ -1,5 +1,6 @@
 import gc
 import logging
+import math
 import time
 from typing import Optional
 
@@ -13,10 +14,33 @@ logger = logging.getLogger(__name__)
 
 KLINE_INTERVAL = Client.KLINE_INTERVAL_1HOUR
 KLINE_LIMIT = 250   # EMA50 için en az 200 mum gerekir; warm-up payıyla 250
-PREFILTER_TOP_N = 30        # 40'tan 30'a düşürüldü — rate limit marjı
+PREFILTER_TOP_N = 25
 KLINE_REQUEST_DELAY = 0.15  # Her kline isteği arası bekleme (saniye)
 
 EXCLUDED_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+
+# Top 100 / büyük cap — düşük volatilite, düşük kâr potansiyeli
+LARGE_CAP_SYMBOLS = {
+    "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT",
+    "DOTUSDT", "MATICUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "UNIUSDT",
+    "ATOMUSDT", "ETCUSDT", "FILUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+    "INJUSDT", "STXUSDT", "SUIUSDT", "SEIUSDT", "TIAUSDT", "RENDERUSDT",
+    "FETUSDT", "WLDUSDT", "PEPEUSDT", "SHIBUSDT", "TRXUSDT", "TONUSDT",
+    "ICPUSDT", "HBARUSDT", "VETUSDT", "MKRUSDT", "AAVEUSDT", "ALGOUSDT",
+    "GRTUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "FTMUSDT", "EGLDUSDT",
+    "KASUSDT", "RUNEUSDT", "LDOUSDT", "CRVUSDT", "SNXUSDT", "IMXUSDT",
+    "FLOWUSDT", "XTZUSDT", "EOSUSDT", "XLMUSDT", "THETAUSDT", "ENSUSDT",
+    "CAKEUSDT", "ZECUSDT", "DASHUSDT", "NEOUSDT", "IOTAUSDT", "CHZUSDT",
+    "GALAUSDT", "ENJUSDT", "COMPUSDT", "1INCHUSDT", "BATUSDT", "ZRXUSDT",
+    "ANKRUSDT", "SKLUSDT", "CELOUSDT", "ROSEUSDT", "QTUMUSDT", "ICXUSDT",
+    "ZILUSDT", "HOTUSDT", "BANDUSDT", "KSMUSDT", "WAVESUSDT", "OMGUSDT",
+}
+
+# Momentum coin aralığı — çok küçük (rug) veya çok büyük (top100) değil
+MIN_VOLUME_MOMENTUM = 400_000       # min 400k USDT hacim
+MAX_VOLUME_MOMENTUM = 60_000_000    # max 60M — üstü büyük cap sayılır
+MIN_CHANGE_PCT = 2.5                # en az %2.5 yükseliş
+MAX_CHANGE_PCT = 30.0               # %30+ pump = geç kalınmış
 
 BANNED_PARTS = [
     "UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT",
@@ -42,27 +66,47 @@ def is_valid_symbol(symbol: str) -> bool:
     return True
 
 
-def prefilter_candidates(tickers_map: dict, min_volume: float) -> list[str]:
+def prefilter_candidates(
+    tickers_map: dict,
+    min_volume: float = None,
+    trending: list = None,
+) -> list[str]:
     """
-    Birinci geçiş: ticker verisiyle hızlı filtre.
-    Hacme göre sıralı en fazla PREFILTER_TOP_N sembol döner.
-    Serbest düşüşteki coinler (-6% altı) elenir.
-    BTC/ETH/BNB piyasa yönü için tickers_map'te kalır ama listeye girmez.
+    Momentum odaklı filtre — top100 hacim listesi DEĞİL.
+    Yüksek % değişim + orta hacimli, trending coinleri önceliklendirir.
     """
-    candidates = []
+    trending_set = set(trending or [])
+    min_vol = min_volume if min_volume else MIN_VOLUME_MOMENTUM
+    scored = []
+
     for symbol, ticker in tickers_map.items():
         if not is_valid_symbol(symbol):
             continue
-        volume = safe_float(ticker["quoteVolume"])
-        if volume < min_volume:
+        if symbol in LARGE_CAP_SYMBOLS:
             continue
+
+        volume = safe_float(ticker["quoteVolume"])
+        if volume < min_vol or volume > MAX_VOLUME_MOMENTUM:
+            continue
+
         change = safe_float(ticker["priceChangePercent"])
+        if change < MIN_CHANGE_PCT or change > MAX_CHANGE_PCT:
+            continue
         if change < -6:
             continue
-        candidates.append((symbol, volume))
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in candidates[:PREFILTER_TOP_N]]
+        # Momentum skoru: % değişim × likidite (log)
+        momentum = change * math.log10(max(volume, 1))
+        if symbol in trending_set:
+            momentum += 30
+        # Sweet spot: %4–15 arası ekstra bonus
+        if 4.0 <= change <= 15.0:
+            momentum += 12
+
+        scored.append((symbol, momentum))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in scored[:PREFILTER_TOP_N]]
 
 
 def get_klines_df(client: Client, symbol: str) -> Optional[pd.DataFrame]:
@@ -293,21 +337,23 @@ def score_coin(ticker: dict, btc_change: float, ind: dict) -> Optional[dict]:
     elif vol_spike > 1.2:
         score += 2
 
-    # --- 24s fiyat değişimi ---
-    if 1.5 <= change <= 5:
-        score += 12
-    elif 5 < change <= 10:
-        score += 6
-    elif 10 < change <= 15:
-        score -= 2
-    elif change > 15:
-        score -= 12
-    elif 0 <= change < 1.5:
-        score += 3
+    # --- 24s fiyat değişimi (momentum coinler için sweet spot) ---
+    if 4.0 <= change <= 12:
+        score += 16
+    elif 12 < change <= 20:
+        score += 10
+    elif 2.5 <= change < 4:
+        score += 8
+    elif 20 < change <= 28:
+        score += 2
+    elif change > 28:
+        score -= 15
+    elif 0 <= change < 2.5:
+        score -= 4
     elif -5 <= change < 0:
-        score -= 6
+        score -= 8
     else:
-        score -= 12
+        score -= 14
 
     # --- Son mum yapısı ---
     if ind.get("candle_bullish"):
