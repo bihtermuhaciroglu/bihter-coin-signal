@@ -21,6 +21,8 @@ from indicators import (
     build_indicators,
     score_coin,
     is_valid_symbol,
+    compute_atr_stop,
+    get_btc_market_strength,
 )
 from trader import (
     market_buy,
@@ -98,7 +100,7 @@ BTC_STRONG_MARKET = 1.5        # BTC bu kadar artınca piyasa sağlıklı
 MAX_CLOSED_SIGNALS = 50
 MAX_SIGNAL_HISTORY = 100
 
-VERSION = "V5"
+VERSION = "V6"
 
 # Otomatik işlem — gerçek emir gönderir
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE", "false").lower() == "true"
@@ -220,16 +222,12 @@ def position_size(usdt_balance: float, score: int) -> dict:
     if usdt_balance <= 0 or score < MIN_BUY_SCORE:
         return {"amount": 0.0, "alloc_pct": 0, "portfolio_risk_pct": 0.0}
 
-    if score >= 95:
-        alloc_pct = 0.95
-    elif score >= 92:
-        alloc_pct = 0.75
-    elif score >= 89:
-        alloc_pct = 0.55
-    elif score >= 86:
+    if score >= 92:
         alloc_pct = 0.40
-    elif score >= 83:
-        alloc_pct = 0.25
+    elif score >= 89:
+        alloc_pct = 0.30
+    elif score >= 86:
+        alloc_pct = 0.20
     else:
         alloc_pct = 0.15
 
@@ -448,9 +446,12 @@ def check_active_signals(
     tickers_map: dict,
     client: Client = None,
     scored: list = None,
+    eff_min_score: float = None,
 ) -> None:
     now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
     score_map = {c["symbol"]: c for c in (scored or [])}
+    if eff_min_score is None:
+        eff_min_score = state.get("adaptive", {}).get("min_score", MIN_BUY_SCORE)
 
     for symbol, signal in list(state["signals"].items()):
         if signal.get("status") not in ("active",):
@@ -490,6 +491,27 @@ def check_active_signals(
                     f"Başka fırsata geçiyoruz."
                 )
                 _auto_execute_sell(client, symbol, state, "flat_exit")
+                continue
+
+            # Coin rotasyonu: elindeki coin zayıflarken daha iyi fırsat varsa geç
+            best_opportunity = max(score_map.values(), key=lambda c: c["score"]) if score_map else None
+            if (best_opportunity
+                    and best_opportunity["symbol"] != symbol
+                    and best_opportunity["score"] >= eff_min_score
+                    and best_opportunity["score"] - (coin_score or 0) >= 15
+                    and pnl >= -1.0   # zararı çok büyük değilse rotasyon yap
+                    and not signal.get("pp1_done")):  # hiç kısmi kâr alınmamışsa
+                signal["status"] = "rotation"
+                signal["time"]   = now_str
+                best_name = best_opportunity["symbol"].replace("USDT", "")
+                send_telegram(
+                    f"🔄 {coin_name} → {best_name} ROTASYON\n\n"
+                    f"{coin_name} skoru: {coin_score}/100\n"
+                    f"{best_name} skoru: {best_opportunity['score']}/100\n"
+                    f"Fark +{best_opportunity['score']-(coin_score or 0)} puan — geçmek mantıklı.\n"
+                    f"PnL: {pnl_usd:+.2f} USDT (%{pnl:.1f})"
+                )
+                _auto_execute_sell(client, symbol, state, "rotation")
                 continue
 
             if coin_score is not None and coin_score < ROTATION_EXIT_SCORE and pnl < 2.0:
@@ -588,52 +610,75 @@ def check_active_signals(
             )
         # ─────────────────────────────────────────────────────────────────
 
+        # ── Partial Profit Taking ──────────────────────────────────────────
+        # +6% → %30 sat | +10% → %30 sat | +15% → %20 sat | kalan %20 trailing
+        qty_now = signal.get("auto_qty", 0)
+
+        if pnl >= 15 and not signal.get("pp3_done") and qty_now > 0:
+            signal["pp3_done"] = True
+            sell_qty = round(qty_now * 0.20, 8)
+            partial_usd = round(amount * 0.20 * pnl / 100, 2)
+            send_telegram(
+                f"💰 {coin_name} — KISMİ KÂR 3/3 (+%15)\n"
+                f"Pozisyonun %20'si satılıyor. Kalan %20 trailing stop'ta.\n"
+                f"Tahmini: +{partial_usd:.2f} USDT"
+            )
+            if client and AUTO_TRADE_ENABLED:
+                market_sell(client, symbol, sell_qty)
+                signal["auto_qty"] = max(0, qty_now - sell_qty)
+
+        elif pnl >= 10 and not signal.get("pp2_done") and qty_now > 0:
+            signal["pp2_done"] = True
+            sell_qty = round(qty_now * 0.30, 8)
+            partial_usd = round(amount * 0.30 * pnl / 100, 2)
+            send_telegram(
+                f"💰 {coin_name} — KISMİ KÂR 2/3 (+%10)\n"
+                f"Pozisyonun %30'u satılıyor.\n"
+                f"Tahmini: +{partial_usd:.2f} USDT"
+            )
+            if client and AUTO_TRADE_ENABLED:
+                market_sell(client, symbol, sell_qty)
+                signal["auto_qty"] = max(0, qty_now - sell_qty)
+
+        elif pnl >= 6 and not signal.get("pp1_done") and qty_now > 0:
+            signal["pp1_done"] = True
+            sell_qty = round(qty_now * 0.30, 8)
+            partial_usd = round(amount * 0.30 * pnl / 100, 2)
+            send_telegram(
+                f"💰 {coin_name} — KISMİ KÂR 1/3 (+%6)\n"
+                f"Pozisyonun %30'u satılıyor.\n"
+                f"Tahmini: +{partial_usd:.2f} USDT"
+            )
+            if client and AUTO_TRADE_ENABLED:
+                market_sell(client, symbol, sell_qty)
+                signal["auto_qty"] = max(0, qty_now - sell_qty)
+        # ─────────────────────────────────────────────────────────────────
+
         if price >= signal["target2"]:
             signal["status"] = "target2"
             signal["time"]   = now_str
             send_telegram(
                 f"🎯 {coin_name} — 2. HEDEFE ULAŞTI!\n\n"
-                f"Tüm pozisyonu sat — harika iş!\n"
+                f"Kalan pozisyon satılıyor.\n"
                 f"💰 Tahmini kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
             )
             if client:
                 _auto_execute_sell(client, symbol, state, "target2")
 
-        elif price >= signal["target1"] and not signal.get("t1_sent"):
-            signal["t1_sent"] = True
-            signal["status"] = "target1"
-            signal["time"] = now_str
-            send_telegram(
-                f"✅ {coin_name} — 1. HEDEFE ULAŞTI, SATILIYOR\n\n"
-                f"💰 Kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
-            )
-            if client and AUTO_TRADE_ENABLED:
-                _auto_execute_sell(client, symbol, state, "target1")
-            elif client:
-                qty = signal.get("auto_qty", 0)
-                if qty > 0:
-                    market_sell(client, symbol, qty / 2)
-                    signal["auto_qty"] = qty / 2
-
         elif price <= signal["stop"]:
             signal["status"] = "stopped"
             signal["time"]   = now_str
             level = signal.get("trailing_level", 0)
-            if level >= 3:
+            if level >= 1:
                 send_telegram(
                     f"🔒 {coin_name} — TRAILING STOP TETİKLENDİ\n\n"
-                    f"Hareketli stop sayesinde kârlı çıktın.\n"
-                    f"💰 Kilitli kâr: +{pnl_usd:.2f} USDT  (%{pnl:.1f})"
-                )
-            elif level >= 2:
-                send_telegram(
-                    f"🔒 {coin_name} — BREAKEVEN ÇIKIŞI\n\n"
-                    f"Stop giriş fiyatına çekilmişti — zarar etmeden çıktın. ✅"
+                    f"Kısmi kârlar zaten alındı, kalan trailing stop'ta kapandı.\n"
+                    f"Son PnL: {pnl_usd:+.2f} USDT  (%{pnl:.1f})"
                 )
             else:
                 send_telegram(
                     f"🛑 {coin_name} — ZARAR KES TETİKLENDİ\n\n"
-                    f"Pozisyonu sat, zararı daha büyümeden çık.\n"
+                    f"Pozisyonu sat, zararı büyütme.\n"
                     f"💸 Tahmini zarar: {pnl_usd:.2f} USDT  (%{pnl:.1f})"
                 )
             if client:
@@ -1027,20 +1072,23 @@ def handle_free_text(text: str, client: Client) -> None:
 
 COMMANDS_HELP = """📋 Kullanılabilir komutlar:
 
-/portfolio   — Portföy analizi ve rotasyon önerileri
-/bakiye      — Binance spot bakiyeni gösterir
-/sinyaller   — Aktif sinyalleri listeler
-/durum       — Bot durumu ve son tarama bilgisi
-/analiz      — Son 100 işlemin istatistikleri
-/seans       — Aktif seans bilgisi
-/seansdurdur — Seansı durdur, her şeyi USDT'ye çevir
-/simulate    — Son 2 günlük simülasyon çalıştır
-/yardim      — Bu listeyi gösterir
+/portfolio    — Portföy analizi ve rotasyon önerileri
+/bakiye       — Binance spot bakiyeni gösterir
+/sinyaller    — Aktif sinyalleri listeler
+/durum        — Bot durumu ve son tarama bilgisi
+/analiz       — Son 100 işlemin istatistikleri
+/seans        — Aktif seans bilgisi
+/seansdurdur  — Seansı durdur, her şeyi USDT'ye çevir
+/simulate     — Son 2 günlük simülasyon çalıştır
+/backtest     — Gerçek geçmiş veri üzerinde backtest (varsayılan 30 gün, 20 sembol)
+/backtest 90  — Son 90 günlük backtest
+/yardim       — Bu listeyi gösterir
 
 💡 Seans başlatmak için:
    *90 usdt 21:00*  yaz → 21:00'a kadar 90 USDT ile işlem yapar"""
 
-_bot_state: dict = {"last_scan": None, "scan_count": 0, "last_cb_state": "NORMAL"}
+_bot_state: dict = {"last_scan": None, "scan_count": 0, "last_cb_state": "NORMAL",
+                    "btc_strength": {"strong": True, "trend_ok": True, "rsi_ok": True, "rsi": 50.0}}
 
 
 def start_command_listener(client: Client) -> None:
@@ -1199,6 +1247,50 @@ def start_command_listener(client: Client) -> None:
                 args=(client,),
                 daemon=True,
             ).start()
+
+        elif text.startswith("/backtest"):
+            parts   = text.split()
+            bt_days = 30
+            bt_top  = 20
+            for p in parts[1:]:
+                if p.isdigit():
+                    val = int(p)
+                    if val <= 365:
+                        bt_days = val
+                    else:
+                        bt_top = val
+            send_telegram(
+                f"⏳ Backtest başlatılıyor — {bt_days} günlük veri, {bt_top} sembol\n"
+                f"Sonuç birkaç dakika içinde gelecek..."
+            )
+            if callback_id:
+                _answer_callback(callback_id, "Backtest başlatıldı...")
+            def _run_backtest():
+                try:
+                    import importlib.util, sys as _sys
+                    spec = importlib.util.spec_from_file_location(
+                        "backtest", os.path.join(os.path.dirname(__file__), "backtest.py")
+                    )
+                    bt = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(bt)
+
+                    syms = bt.get_symbols(client, top_n=bt_top)
+                    all_trades = []
+                    interval   = Client.KLINE_INTERVAL_1HOUR
+                    for sym in syms:
+                        df = bt.fetch_ohlcv(client, sym, interval, bt_days)
+                        if df is None or len(df) < 80:
+                            continue
+                        trades = bt.backtest_symbol(df, sym)
+                        all_trades.extend(trades)
+                    report = bt.build_report(all_trades, bt_days)
+                    bt.save_json(all_trades)
+                    # Telegram 4096 karakter limiti
+                    for chunk in [report[i:i+3900] for i in range(0, len(report), 3900)]:
+                        send_telegram(f"```\n{chunk}\n```")
+                except Exception as e:
+                    send_telegram(f"❌ Backtest hata: {e}")
+            threading.Thread(target=_run_backtest, daemon=True).start()
 
         elif text in ("/yardim", "/help", "/start"):
             send_telegram(COMMANDS_HELP)
@@ -1472,6 +1564,40 @@ def _parse_session_command(text: str) -> Optional[tuple]:
     return budget, end_time
 
 
+def _record_trade(state: dict, result: dict, signal: dict) -> None:
+    """İşlemi zengin context ile kaydet — gerçek öğrenme için."""
+    try:
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        fg      = getattr(market_intel, "fear_greed", None)
+        btc_str = _bot_state.get("btc_strength", {})
+        entry   = {
+            **result,
+            "signal_score":   signal.get("score"),
+            "stop":           signal.get("stop"),
+            "target1":        signal.get("target1"),
+            "target2":        signal.get("target2"),
+            "atr_stop_pct":   signal.get("atr_stop_pct"),
+            "exit_reason":    None,
+            "pnl_usdt":       None,
+            "pnl_pct":        None,
+            # öğrenme context
+            "weekday":        now_utc.strftime("%A"),
+            "hour_utc":       now_utc.hour,
+            "fear_greed":     fg,
+            "btc_trend_ok":   btc_str.get("trend_ok"),
+            "btc_rsi_ok":     btc_str.get("rsi_ok"),
+            "btc_rsi":        btc_str.get("rsi"),
+            "funding_rate":   (
+                getattr(market_intel, "funding_rates", {}).get(signal.get("symbol", ""), None)
+                if market_intel else None
+            ),
+            "reddit_score":   getattr(market_intel, "reddit_score", None),
+        }
+        state.setdefault("trades", []).append(entry)
+    except Exception as e:
+        logger.warning("_record_trade hata: %s", e)
+
+
 def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
     """
     Sinyal için gerçek market alım yapar (seans varsa seans bütçesinden, yoksa bakiyeden).
@@ -1500,15 +1626,7 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
                 result["avg_price"],
                 _effective_stop_pct(),
             )
-            state["trades"].append({
-                **result,
-                "signal_score": signal["score"],
-                "stop":         signal["stop"],
-                "target1":      signal["target1"],
-                "target2":      signal["target2"],
-                "exit_reason":  None,
-                "pnl_usdt":     None,
-            })
+            _record_trade(state, result, signal)
             send_telegram(
                 f"🤖 OTOMATİK ALIM YAPILDI\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1529,15 +1647,7 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
                 result["avg_price"],
                 _effective_stop_pct(),
             )
-            state["trades"].append({
-                **result,
-                "signal_score": signal["score"],
-                "stop":         signal["stop"],
-                "target1":      signal["target1"],
-                "target2":      signal["target2"],
-                "exit_reason":  None,
-                "pnl_usdt":     None,
-            })
+            _record_trade(state, result, signal)
             send_telegram(
                 f"🤖 OTOMATİK ALIM YAPILDI\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1713,6 +1823,13 @@ def run_bot() -> None:
             btc_price = safe_float(btc["lastPrice"]) if btc else 0.0
             btc_tracker.record(btc_price)
 
+            # Güçlü BTC filtresi — her 3 taramada bir yenile (API tasarrufu)
+            if _bot_state["scan_count"] % 3 == 0:
+                btc_strength = get_btc_market_strength(client)
+                _bot_state["btc_strength"] = btc_strength
+            else:
+                btc_strength = _bot_state.get("btc_strength", {"strong": True, "trend_ok": True, "rsi_ok": True})
+
             # Flash crash kontrolü
             btc_15m = btc_tracker.change_in_minutes(15)
             btc_5m  = btc_tracker.change_in_minutes(5)
@@ -1758,9 +1875,18 @@ def run_bot() -> None:
 
             # Bakiyedeki tüm coinleri takibe al, sonra satış kontrolü
             _sync_holdings_to_state(balances, state, tickers_map)
-            check_active_signals(state, tickers_map, client, scored)
+            check_active_signals(state, tickers_map, client, scored, eff_min_score)
 
-            market_paused = btc_change < BTC_PAUSE_THRESHOLD or not circuit_breaker.can_open_position()
+            btc_weak = not btc_strength.get("strong", True)
+            market_paused = (
+                btc_change < BTC_PAUSE_THRESHOLD
+                or not circuit_breaker.can_open_position()
+                or btc_weak
+            )
+            if btc_weak:
+                logger.info("BTC zayıf — EMA trend:%s RSI:%.1f, yeni alım kapalı.",
+                            btc_strength.get("trend_ok"), btc_strength.get("rsi", 0))
+
             open_positions = _count_open_positions(state, balances)
             if open_positions >= MAX_OPEN_POSITIONS:
                 logger.info("Max açık pozisyon (%d/%d), yeni alım kapalı.",
@@ -1786,7 +1912,15 @@ def run_bot() -> None:
                     if should_send_new_signal(coin["symbol"], adjusted_score, state, balances):
                         coin["score"] = adjusted_score
                         signal = create_signal(coin, effective_usdt)
-                        _apply_exit_levels(signal, signal["entry"], eff_stop_pct if not AUTO_TRADE_ENABLED else _effective_stop_pct())
+                        # ATR bazlı dinamik stop
+                        try:
+                            _df_atr = get_klines_df(client, coin["symbol"])
+                            atr_stop = compute_atr_stop(_df_atr) if _df_atr is not None else _effective_stop_pct()
+                            del _df_atr
+                        except Exception:
+                            atr_stop = _effective_stop_pct()
+                        _apply_exit_levels(signal, signal["entry"], atr_stop)
+                        signal["atr_stop_pct"] = round(atr_stop * 100, 2)
                         signal["intel_bonus"] = intel_bonus
                         # Volatilite ayarı
                         signal["amount"] = round(signal["amount"] * cb_mult, 2)

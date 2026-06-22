@@ -299,6 +299,9 @@ class MarketIntelligence:
         self.oi_changes: Dict[str, float]  = {}
         self.last_update: Optional[datetime] = None
         self._lock = __import__("threading").Lock()
+        # Kolay erişim özellikleri (öğrenme context için)
+        self.funding_rates: Dict[str, float] = {}  # symbol → rate
+        self.reddit_score:  Optional[float]  = None
 
     def is_stale(self, max_age_minutes: int = 30) -> bool:
         if not self.last_update:
@@ -315,6 +318,9 @@ class MarketIntelligence:
             self.trending   = get_trending_coins()
             if client:
                 self.funding = get_funding_rates(client, top_n=10)
+                self.funding_rates = {f["symbol"]: f["rate"] for f in self.funding}
+            if self.reddit:
+                self.reddit_score = self.reddit.get("score")
             self.last_update = datetime.now(timezone.utc).replace(tzinfo=None)
             logger.info(
                 "Piyasa zekası güncellendi — F&G:%s  Reddit:%s  Trend:%s",

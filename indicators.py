@@ -418,6 +418,58 @@ def score_coin(ticker: dict, btc_change: float, ind: dict) -> Optional[dict]:
     }
 
 
+def compute_atr_stop(df: pd.DataFrame, multiplier: float = 2.0, period: int = 14) -> float:
+    """
+    ATR bazlı stop mesafesi hesaplar.
+    Dönen değer: fiyatın yüzde kaçı aşağıda stop koyulacağı (0.03 = %3)
+    """
+    try:
+        high  = df["high"]
+        low   = df["low"]
+        close = df["close"]
+        trs   = []
+        for i in range(1, len(df)):
+            tr = max(
+                float(high.iloc[i])  - float(low.iloc[i]),
+                abs(float(high.iloc[i])  - float(close.iloc[i-1])),
+                abs(float(low.iloc[i])   - float(close.iloc[i-1])),
+            )
+            trs.append(tr)
+        atr      = sum(trs[-period:]) / period if len(trs) >= period else sum(trs) / max(len(trs), 1)
+        last_close = float(close.iloc[-1])
+        stop_pct   = (atr * multiplier) / last_close if last_close > 0 else 0.05
+        # Sınırlar: min %1.5, max %15
+        return max(0.015, min(0.15, stop_pct))
+    except Exception:
+        return 0.05   # fallback %5
+
+
+def get_btc_market_strength(client: Client) -> dict:
+    """
+    BTC'nin günlük EMA20/50 trendi ve RSI'sını döner.
+    Güçlü piyasa: EMA20 > EMA50 VE RSI > 50
+    """
+    try:
+        raw    = client.get_klines(symbol="BTCUSDT", interval=Client.KLINE_INTERVAL_1DAY, limit=60)
+        closes = pd.Series([float(r[4]) for r in raw])
+        ema20  = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50  = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+        rsi    = RSIIndicator(close=closes, window=14).rsi().iloc[-1]
+        del closes, raw
+        trend_ok = ema20 > ema50
+        rsi_ok   = float(rsi) > 50
+        return {
+            "trend_ok": trend_ok,
+            "rsi_ok":   rsi_ok,
+            "strong":   trend_ok and rsi_ok,
+            "ema20":    ema20,
+            "ema50":    ema50,
+            "rsi":      float(rsi),
+        }
+    except Exception:
+        return {"trend_ok": True, "rsi_ok": True, "strong": True, "ema20": 0, "ema50": 0, "rsi": 50}
+
+
 def get_4h_trend(client: Client, symbol: str) -> int:
     """
     4H EMA20/50 trendini kontrol eder.
