@@ -74,22 +74,22 @@ MIN_BUY_SCORE = 82             # Sadece gerçekten güçlü sinyaller
 _env_portfolio = os.getenv("PORTFOLIO_SIZE_USDT")
 PORTFOLIO_SIZE_USDT = float(_env_portfolio) if _env_portfolio else None
 
-STOP_LOSS_PCT = 0.045          # Stop %4.5 (sinyal modu)
-AUTO_STOP_LOSS_PCT = float(os.getenv("AUTO_STOP_LOSS_PCT", "0.025"))  # Otomatik: %2.5
-TARGET1_PCT = 0.06             # Hedef 1 %6 (sinyal modu)
-TARGET2_PCT = 0.13             # Hedef 2 %13 (sinyal modu)
+STOP_LOSS_PCT = 0.10           # Stop %10 — geniş, erken stop yemez
+AUTO_STOP_LOSS_PCT = 0.10      # Otomatik modda da %10 stop
+TARGET1_PCT = 0.12             # Hedef 1 %12 (sinyal modu)
+TARGET2_PCT = 0.25             # Hedef 2 %25 (sinyal modu)
 
-# Otomatik işlem modu — komisyon (~%0.2) sonrası net kâr için daha düşük hedefler
-AUTO_TARGET1_PCT = float(os.getenv("AUTO_TARGET1_PCT", "0.025"))   # %2.5
-AUTO_TARGET2_PCT = float(os.getenv("AUTO_TARGET2_PCT", "0.05"))    # %5
-QUICK_PROFIT_PCT = float(os.getenv("QUICK_PROFIT_PCT", "0.018"))   # %1.8 hızlı çık
-MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "1.5"))         # 1.5 saat
-MIN_PROFIT_AFTER_HOLD = float(os.getenv("MIN_PROFIT_AFTER_HOLD", "0.008"))  # %0.8
-STALE_LOSS_HOURS = float(os.getenv("STALE_LOSS_HOURS", "1.5"))
-STALE_LOSS_PCT = float(os.getenv("STALE_LOSS_PCT", "-0.3"))        # %0.3 eksi = kes
-ROTATION_EXIT_SCORE = int(os.getenv("ROTATION_EXIT_SCORE", "72"))
-FLAT_EXIT_HOURS = float(os.getenv("FLAT_EXIT_HOURS", "0.75"))      # 45 dk yatay = çık
-FLAT_EXIT_MAX_PNL = float(os.getenv("FLAT_EXIT_MAX_PNL", "0.5"))   # %0.5 altı kâr
+# Otomatik işlem modu
+AUTO_TARGET1_PCT = float(os.getenv("AUTO_TARGET1_PCT", "0.08"))    # %8
+AUTO_TARGET2_PCT = float(os.getenv("AUTO_TARGET2_PCT", "0.18"))    # %18
+QUICK_PROFIT_PCT = float(os.getenv("QUICK_PROFIT_PCT", "0.05"))    # %5 hızlı çık
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "6"))           # 6 saat bekle
+MIN_PROFIT_AFTER_HOLD = float(os.getenv("MIN_PROFIT_AFTER_HOLD", "0.03"))  # %3
+STALE_LOSS_HOURS = float(os.getenv("STALE_LOSS_HOURS", "8"))       # 8 saat ekside kal
+STALE_LOSS_PCT = float(os.getenv("STALE_LOSS_PCT", "-6"))          # %-6 ekside kes
+ROTATION_EXIT_SCORE = int(os.getenv("ROTATION_EXIT_SCORE", "65"))  # Skor 65 altı = çık
+FLAT_EXIT_HOURS = float(os.getenv("FLAT_EXIT_HOURS", "3"))         # 3 saat yatay = çık
+FLAT_EXIT_MAX_PNL = float(os.getenv("FLAT_EXIT_MAX_PNL", "1.0"))   # %1 altı kâr yatay
 BINANCE_FEE_PCT = 0.001        # tek yön %0.1
 
 BTC_PAUSE_THRESHOLD = -2.0     # BTC bu kadar düşünce yeni sinyal gönderme
@@ -400,8 +400,9 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
         # Piyasa durumu kısa özet
         intel_line = market_intel.summary_text().split("\n")[0] if not market_intel.is_stale() else ""
 
-        t1_breakeven = round(entry * 1.00, 6)
-        t1_guarantee = round(entry * 1.05, 6)
+        breakeven_price  = round(entry * 1.00, 6)
+        lock5_price      = round(entry * 1.05, 6)
+        lock10_price     = round(entry * 1.10, 6)
 
         lines = [
             f"🚨 {coin_name} — AL SİNYALİ  {strength}",
@@ -410,13 +411,14 @@ def send_buy_signals(new_signals: list, usdt_balance: float, effective_usdt: flo
             f"✅ {entry:.6f} fiyatından AL",
             f"   👉 {amount} USDT harca{bonus_str}",
             f"",
-            f"🛑 {stop:.6f} fiyatına düşerse SAT  (−{risk_usd:.2f} USDT)",
+            f"🛑 {stop:.6f} fiyatına düşerse SAT  (−{risk_usd:.2f} USDT / -%{AUTO_STOP_LOSS_PCT*100:.0f})",
             f"🎯 {t1:.6f} fiyatına gelince SAT  (+{gain1_usd:.2f} USDT) ← 1. hedef",
             f"🚀 {t2:.6f} fiyatına gelince SAT  (+{gain2_usd:.2f} USDT) ← 2. hedef",
             f"",
-            f"📈 HAREKETLİ STOP (otomatik):",
-            f"   %5 kârda  → stop {t1_breakeven:.6f}'e çıkar  (zarar etmezsin)",
-            f"   %10 kârda → stop {t1_guarantee:.6f}'e çıkar  (+%5 garanti)",
+            f"📈 HAREKETLİ STOP:",
+            f"   %5 kârda  → stop {breakeven_price:.6f} (zarar etmezsin)",
+            f"   %10 kârda → stop {lock5_price:.6f} (+%5 garanti)",
+            f"   %15 kârda → stop {lock10_price:.6f} (+%10 garanti)",
             f"",
             f"📊 Bakiyen: {usdt_balance:.2f} USDT  |  Bu işlem bakiyenin %{sig['alloc_pct']}'i",
         ]
@@ -532,31 +534,31 @@ def check_active_signals(
         #
         #  Kâr %5+  → stop = giriş fiyatı       (zarar etmezsin)
         #  Kâr %10+ → stop = giriş × 1.05        (en az %5 kâr garanti)
-        #  Kâr %13+ → stop = giriş × 1.08        (en az %8 kâr garanti)
-        #  Sonraki her %3 kârda stop +%2 yükselir (kârı takip eder)
+        #  Kâr %15+ → stop = giriş × 1.10        (en az %10 kâr garanti)
+        #  Kâr %20+ sonrası her %5'te stop %3 yukarı
         #
         new_stop = signal["stop"]
 
-        if pnl >= 13 and signal.get("trailing_level", 0) < 4:
-            new_stop = max(signal["stop"], round(entry * 1.08, 8))
+        if pnl >= 20 and signal.get("trailing_level", 0) < 4:
+            new_stop = max(signal["stop"], round(entry * 1.12, 8))
             if new_stop > signal["stop"]:
                 signal["trailing_level"] = 4
-        elif pnl >= 10 and signal.get("trailing_level", 0) < 3:
-            new_stop = max(signal["stop"], round(entry * 1.05, 8))
+        elif pnl >= 15 and signal.get("trailing_level", 0) < 3:
+            new_stop = max(signal["stop"], round(entry * 1.10, 8))
             if new_stop > signal["stop"]:
                 signal["trailing_level"] = 3
-        elif pnl >= 5 and signal.get("trailing_level", 0) < 2:
-            new_stop = max(signal["stop"], round(entry * 1.00, 8))  # breakeven
+        elif pnl >= 10 and signal.get("trailing_level", 0) < 2:
+            new_stop = max(signal["stop"], round(entry * 1.05, 8))
             if new_stop > signal["stop"]:
                 signal["trailing_level"] = 2
-        elif pnl >= 3 and signal.get("trailing_level", 0) < 1:
-            new_stop = max(signal["stop"], round(entry * 0.98, 8))  # zararı azalt
+        elif pnl >= 5 and signal.get("trailing_level", 0) < 1:
+            new_stop = max(signal["stop"], round(entry * 1.00, 8))  # breakeven
             if new_stop > signal["stop"]:
                 signal["trailing_level"] = 1
 
-        # Dinamik trailing: %10+ kârdan sonra her %3'te stop %2 yukarı
-        if pnl >= 10:
-            dynamic_stop = round(entry * (1 + (pnl - 5) / 100 * 0.65), 8)
+        # Dinamik trailing: %15+ kârdan sonra her %5'te stop %3 yukarı
+        if pnl >= 15:
+            dynamic_stop = round(entry * (1 + (pnl - 8) / 100 * 0.60), 8)
             new_stop = max(new_stop, dynamic_stop)
 
         # Stop yükseldiyse kaydet ve bildir
