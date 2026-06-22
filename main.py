@@ -65,8 +65,8 @@ SIGNAL_RESEND_SCORE_DELTA = 8 # Cooldown içinde yeniden göndermek için gereke
 MIN_VOLUME_USDT = 400_000     # Momentum coinler — düşük hacimli ama likit
 STATE_FILE = "state.json"
 
-MAX_NEW_SIGNALS = 2            # Aynı anda max 2 yeni alım
-MAX_OPEN_POSITIONS = 2         # Toplam açık pozisyon limiti
+MAX_NEW_SIGNALS = 3            # Aynı anda max 3 yeni alım
+MAX_OPEN_POSITIONS = 3         # Toplam açık pozisyon limiti
 MIN_BUY_SCORE = 82             # Sadece gerçekten güçlü sinyaller
 
 # Render Environment Variables'tan opsiyonel olarak set et:
@@ -208,23 +208,30 @@ def get_tickers_map(client: Client) -> dict:
 
 def position_size(usdt_balance: float, score: int) -> dict:
     """
-    Risk-bazlı pozisyon hesabı.
-    Stop %3 varsayılarak, portföye olan risk yüzdesi de gösterilir.
+    Agresif pozisyon boyutu — yüksek skor = büyük pozisyon.
 
-    Tier eşikleri:
-        80+  → bakiyenin %15'i
-        75+  → bakiyenin %10'u
-        70+  → bakiyenin %5'i
+    Skor  95+  → bakiyenin %95'i  (neredeyse tümü — çok nadir)
+    Skor  92+  → bakiyenin %75'i
+    Skor  89+  → bakiyenin %55'i
+    Skor  86+  → bakiyenin %40'ı
+    Skor  83+  → bakiyenin %25'i
+    Skor  80+  → bakiyenin %15'i
     """
     if usdt_balance <= 0 or score < MIN_BUY_SCORE:
         return {"amount": 0.0, "alloc_pct": 0, "portfolio_risk_pct": 0.0}
 
-    if score >= 80:
-        alloc_pct = 0.15
-    elif score >= 75:
-        alloc_pct = 0.10
+    if score >= 95:
+        alloc_pct = 0.95
+    elif score >= 92:
+        alloc_pct = 0.75
+    elif score >= 89:
+        alloc_pct = 0.55
+    elif score >= 86:
+        alloc_pct = 0.40
+    elif score >= 83:
+        alloc_pct = 0.25
     else:
-        alloc_pct = 0.05
+        alloc_pct = 0.15
 
     amount = round(usdt_balance * alloc_pct, 2)
     max_loss = round(amount * STOP_LOSS_PCT, 2)
