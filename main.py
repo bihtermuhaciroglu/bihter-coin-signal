@@ -280,22 +280,33 @@ def _effective_stop_pct() -> float:
     return STOP_LOSS_PCT
 
 
-def _count_open_positions(state: dict, balances: dict) -> int:
-    """Aktif sinyal + bakiyede coin varsa say."""
+def _count_open_positions(state: dict, balances: dict, tickers_map: dict = None) -> int:
+    """Aktif sinyal say. 5 USDT altındaki toz bakiyeler sayılmaz."""
     seen = set()
     for sym, sig in state.get("signals", {}).items():
         if sig.get("status") == "active":
             seen.add(sym)
     for asset, qty in balances.items():
-        if asset != "USDT" and qty > 0:
-            seen.add(asset + "USDT")
+        if asset == "USDT" or qty <= 0:
+            continue
+        sym   = asset + "USDT"
+        price = 0.0
+        if tickers_map:
+            t = tickers_map.get(sym)
+            if t:
+                price = safe_float(t["lastPrice"])
+        value = qty * price if price else 999
+        if value >= MIN_SYNC_VALUE_USDT:
+            seen.add(sym)
     return len(seen)
 
+
+MIN_SYNC_VALUE_USDT = 5.0   # Toz pozisyonları yoksay (<5 USDT değeri)
 
 def _sync_holdings_to_state(balances: dict, state: dict, tickers_map: dict) -> None:
     """
     Binance'deki coinleri state'e bağla — satış takibi kaçırılmasın.
-    Bot dışında alınmış veya kayıt düşmemiş pozisyonları izler.
+    5 USDT altındaki toz pozisyonları yoksayar.
     """
     now_str = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     for asset, qty in balances.items():
@@ -306,28 +317,36 @@ def _sync_holdings_to_state(balances: dict, state: dict, tickers_map: dict) -> N
         if not ticker:
             continue
         price = safe_float(ticker["lastPrice"])
+        value = qty * price
+
         sig = state["signals"].get(symbol)
         if sig and sig.get("status") == "active":
             if not sig.get("auto_qty") or sig["auto_qty"] <= 0:
                 sig["auto_qty"] = qty
             continue
-        # Kayıtsız pozisyon — takibe al
+
+        # Toz miktarlar — senkronize etme, durumu kirletmesin
+        if value < MIN_SYNC_VALUE_USDT:
+            continue
+
+        # Kayıtsız ama anlamlı pozisyon — takibe al
         state["signals"][symbol] = {
-            "symbol": symbol,
-            "status": "active",
-            "time": now_str,
-            "entry": price,
+            "symbol":     symbol,
+            "status":     "active",
+            "time":       now_str,
+            "entry":      price,
             "auto_price": price,
-            "auto_qty": qty,
-            "auto_cost": qty * price,
-            "amount": round(qty * price, 2),
-            "score": 0,
-            "orphan": True,
-            "stop": round(price * (1 - _effective_stop_pct()), 8),
-            "target1": round(price * (1 + _target_pcts()[0]), 8),
-            "target2": round(price * (1 + _target_pcts()[1]), 8),
+            "auto_qty":   qty,
+            "auto_cost":  round(value, 4),
+            "amount":     round(value, 2),
+            "score":      0,
+            "orphan":     True,
+            "stop":       round(price * (1 - _effective_stop_pct()), 8),
+            "target1":    round(price * (1 + _target_pcts()[0]), 8),
+            "target2":    round(price * (1 + _target_pcts()[1]), 8),
         }
-        logger.info("Kayıtsız pozisyon takibe alındı: %s qty=%.6f", symbol, qty)
+        logger.info("Kayıtsız pozisyon takibe alındı: %s qty=%.6f değer=%.2f USDT",
+                    symbol, qty, value)
 
 
 def _effective_entry(signal: dict) -> float:
@@ -1887,7 +1906,7 @@ def run_bot() -> None:
                 logger.info("BTC zayıf — EMA trend:%s RSI:%.1f, yeni alım kapalı.",
                             btc_strength.get("trend_ok"), btc_strength.get("rsi", 0))
 
-            open_positions = _count_open_positions(state, balances)
+            open_positions = _count_open_positions(state, balances, tickers_map)
             if open_positions >= MAX_OPEN_POSITIONS:
                 logger.info("Max açık pozisyon (%d/%d), yeni alım kapalı.",
                             open_positions, MAX_OPEN_POSITIONS)
