@@ -1817,7 +1817,8 @@ def run_bot() -> None:
     send_telegram(
         f"✅ Bihter Coin Signal {VERSION} başladı.\n"
         f"{auto_label}\n\n"
-        + COMMANDS_HELP
+        + COMMANDS_HELP,
+        dedup=False,
     )
     logger.info("Bot %s başlatıldı. AUTO_TRADE=%s", VERSION, AUTO_TRADE_ENABLED)
 
