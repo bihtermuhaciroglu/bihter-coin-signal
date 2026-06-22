@@ -119,11 +119,41 @@ _analysis_lock = threading.Semaphore(1)
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(text: str, reply_markup: dict = None) -> None:
+_tg_sent_cache: dict = {}   # mesaj_hash → son_gönderim_timestamp
+_TG_DEDUP_SECONDS = 300     # Aynı mesaj 5 dk içinde tekrar gönderilmez
+_TG_RATE_WINDOW   = 60      # saniye
+_TG_RATE_LIMIT    = 20      # pencerede max mesaj sayısı
+_tg_rate_times: list = []   # son gönderim zamanları
+
+def send_telegram(text: str, reply_markup: dict = None, dedup: bool = True) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram kimlik bilgileri eksik.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    now = time.time()
+
+    # Hız limiti — dakikada 20 mesaj
+    _tg_rate_times[:] = [t for t in _tg_rate_times if now - t < _TG_RATE_WINDOW]
+    if len(_tg_rate_times) >= _TG_RATE_LIMIT:
+        logger.warning("Telegram hız limiti — mesaj atlandı.")
+        return
+    _tg_rate_times.append(now)
+
+    # Tekrar önleme — aynı mesaj 5 dk içinde bir kez
+    if dedup:
+        import hashlib
+        key = hashlib.md5(text[:200].encode()).hexdigest()
+        last_sent = _tg_sent_cache.get(key, 0)
+        if now - last_sent < _TG_DEDUP_SECONDS:
+            return
+        _tg_sent_cache[key] = now
+        # Cache büyümesin
+        if len(_tg_sent_cache) > 500:
+            oldest = sorted(_tg_sent_cache, key=lambda k: _tg_sent_cache[k])
+            for k in oldest[:100]:
+                del _tg_sent_cache[k]
+
+    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -1123,6 +1153,10 @@ def start_command_listener(client: Client) -> None:
         except Exception:
             pass
 
+    def _reply(msg: str, markup: dict = None) -> None:
+        """Komut yanıtları — dedup olmadan her zaman gönder."""
+        send_telegram(msg, reply_markup=markup, dedup=False)
+
     def _handle_command(text: str, callback_id: str = None) -> None:
         if text == "/portfolio":
             logger.info("/portfolio komutu alındı.")
@@ -1146,9 +1180,9 @@ def start_command_listener(client: Client) -> None:
                     lines.append("\nDiğer varlıklar:")
                     for asset, qty in assets:
                         lines.append(f"  {asset}: {qty:.6f}")
-                send_telegram("\n".join(lines))
+                _reply("\n".join(lines))
             except Exception as exc:
-                send_telegram(f"⚠️ Bakiye hatası: {exc}")
+                _reply(f"⚠️ Bakiye hatası: {exc}")
             if callback_id:
                 _answer_callback(callback_id)
 
@@ -1156,7 +1190,7 @@ def start_command_listener(client: Client) -> None:
             state = load_state()
             active = {s: v for s, v in state["signals"].items() if v.get("status") == "active"}
             if not active:
-                send_telegram("📭 Şu an aktif açık sinyal yok.")
+                _reply("📭 Şu an aktif açık sinyal yok.")
             else:
                 lines = [f"📡 AKTİF SİNYALLER ({len(active)} adet)\n"]
                 for sym, sig in active.items():
@@ -1164,7 +1198,7 @@ def start_command_listener(client: Client) -> None:
                         f"• {sym}  Skor:{sig['score']}  Giriş:{sig['entry']:.6f}"
                         f"  Stop:{sig['stop']:.6f}  H1:{sig['target1']:.6f}"
                     )
-                send_telegram("\n".join(lines))
+                _reply("\n".join(lines))
             if callback_id:
                 _answer_callback(callback_id)
 
@@ -1207,7 +1241,7 @@ def start_command_listener(client: Client) -> None:
             if not market_intel.is_stale():
                 lines.append("")
                 lines.append(market_intel.summary_text())
-            send_telegram("\n".join(lines))
+            _reply("\n".join(lines))
             if callback_id:
                 _answer_callback(callback_id)
 
@@ -1215,11 +1249,11 @@ def start_command_listener(client: Client) -> None:
             state = load_state()
             trades = state.get("trades", [])
             if not trades:
-                send_telegram("📭 Henüz kaydedilmiş işlem yok.\nOtomatik işlem modu açık değil veya hiç işlem yapılmadı.")
+                _reply("📭 Henüz kaydedilmiş işlem yok.\nOtomatik işlem modu açık değil veya hiç işlem yapılmadı.")
             else:
                 recent = trades[-100:]
                 stats  = analyze_trade_history(recent)
-                send_telegram(format_analysis_report(stats))
+                _reply(format_analysis_report(stats))
             if callback_id:
                 _answer_callback(callback_id)
 
@@ -1227,7 +1261,7 @@ def start_command_listener(client: Client) -> None:
             sess = get_active_session()
             if sess:
                 remaining = (sess.end_time - datetime.now(timezone.utc).replace(tzinfo=None)).seconds // 60
-                send_telegram(
+                _reply(
                     f"📋 AKTİF SEANS\n"
                     f"Bütçe      : {sess.budget_usdt:.2f} USDT\n"
                     f"Kalan      : {sess.remaining_usdt:.2f} USDT\n"
@@ -1236,7 +1270,7 @@ def start_command_listener(client: Client) -> None:
                     f"İşlem sayısı: {len(sess.trades)}"
                 )
             else:
-                send_telegram(
+                _reply(
                     "📭 Aktif seans yok.\n\n"
                     "Seans başlatmak için şöyle yaz:\n"
                     "  *90 usdt 21:00*\n"
@@ -1248,17 +1282,17 @@ def start_command_listener(client: Client) -> None:
         elif text == "/seansdurdur":
             sess = get_active_session()
             if sess:
-                send_telegram("⏹ Seans durduruluyor, pozisyonlar kapatılıyor...")
+                _reply("⏹ Seans durduruluyor, pozisyonlar kapatılıyor...")
                 _check_session_expiry(client, load_state())
                 end_session()
-                send_telegram("✅ Seans durduruldu.")
+                _reply("✅ Seans durduruldu.")
             else:
-                send_telegram("Aktif seans yok.")
+                _reply("Aktif seans yok.")
             if callback_id:
                 _answer_callback(callback_id)
 
         elif text == "/simulate":
-            send_telegram("⏳ 2 günlük simülasyon başlatılıyor (3-5 dk sürebilir)...")
+            _reply("⏳ 2 günlük simülasyon başlatılıyor (3-5 dk sürebilir)...")
             if callback_id:
                 _answer_callback(callback_id, "Simülasyon başlatıldı...")
             threading.Thread(
@@ -1278,7 +1312,7 @@ def start_command_listener(client: Client) -> None:
                         bt_days = val
                     else:
                         bt_top = val
-            send_telegram(
+            _reply(
                 f"⏳ Backtest başlatılıyor — {bt_days} günlük veri, {bt_top} sembol\n"
                 f"Sonuç birkaç dakika içinde gelecek..."
             )
@@ -1286,7 +1320,7 @@ def start_command_listener(client: Client) -> None:
                 _answer_callback(callback_id, "Backtest başlatıldı...")
             def _run_backtest():
                 try:
-                    import importlib.util, sys as _sys
+                    import importlib.util
                     spec = importlib.util.spec_from_file_location(
                         "backtest", os.path.join(os.path.dirname(__file__), "backtest.py")
                     )
@@ -1304,15 +1338,14 @@ def start_command_listener(client: Client) -> None:
                         all_trades.extend(trades)
                     report = bt.build_report(all_trades, bt_days)
                     bt.save_json(all_trades)
-                    # Telegram 4096 karakter limiti
                     for chunk in [report[i:i+3900] for i in range(0, len(report), 3900)]:
-                        send_telegram(f"```\n{chunk}\n```")
+                        send_telegram(f"```\n{chunk}\n```", dedup=False)
                 except Exception as e:
-                    send_telegram(f"❌ Backtest hata: {e}")
+                    send_telegram(f"❌ Backtest hata: {e}", dedup=False)
             threading.Thread(target=_run_backtest, daemon=True).start()
 
         elif text in ("/yardim", "/help", "/start"):
-            send_telegram(COMMANDS_HELP)
+            _reply(COMMANDS_HELP)
             if callback_id:
                 _answer_callback(callback_id)
 
