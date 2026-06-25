@@ -109,7 +109,7 @@ BTC_STRONG_MARKET = 1.5        # BTC bu kadar artınca piyasa sağlıklı
 # ─── Futures ayarları ─────────────────────────────────────────────────────────
 FUTURES_ENABLED  = os.getenv("FUTURES_ENABLED", "false").lower() == "true"
 FUTURES_LEVERAGE = int(os.getenv("FUTURES_LEVERAGE", "3"))
-FUTURES_MIN_SCORE = 85          # Futures için daha yüksek skor şartı
+FUTURES_MIN_SCORE = 80          # Futures için min skor (spot ile aynı)
 
 MAX_CLOSED_SIGNALS = 50
 MAX_SIGNAL_HISTORY = 100
@@ -1189,16 +1189,19 @@ def start_command_listener(client: Client) -> None:
                 ]
                 if FUTURES_ENABLED:
                     fut_bal = get_futures_balance(client)
-                    lines.append(f"Futures USDT: {fut_bal:.4f} USDT")
-                    open_pos = get_open_futures_positions(client)
-                    if open_pos:
-                        lines.append(f"\nAçık futures pozisyonlar ({len(open_pos)}):")
-                        for p in open_pos:
-                            pnl_sign = "+" if p["unrealized_pnl"] >= 0 else ""
-                            lines.append(
-                                f"  {p['symbol'].replace('USDT','')}  {p['leverage']}x  "
-                                f"PnL: {pnl_sign}{p['unrealized_pnl']:.2f} USDT"
-                            )
+                    if fut_bal > 0:
+                        lines.append(f"Futures USDT: {fut_bal:.4f} USDT")
+                        open_pos = get_open_futures_positions(client)
+                        if open_pos:
+                            lines.append(f"\nAçık futures pozisyonlar ({len(open_pos)}):")
+                            for p in open_pos:
+                                pnl_sign = "+" if p["unrealized_pnl"] >= 0 else ""
+                                lines.append(
+                                    f"  {p['symbol'].replace('USDT','')}  {p['leverage']}x  "
+                                    f"PnL: {pnl_sign}{p['unrealized_pnl']:.2f} USDT"
+                                )
+                    else:
+                        lines.append("Futures: izin bekleniyor (API key'de Enable Futures gerekli)")
                 if PORTFOLIO_SIZE_USDT:
                     lines.append(f"Pozisyon   : {eff:.2f} USDT (manuel ayar)")
                 assets = [(a, v) for a, v in balances.items() if a != "USDT" and v > 0]
@@ -2003,17 +2006,17 @@ def run_bot() -> None:
             _sync_holdings_to_state(balances, state, tickers_map)
             check_active_signals(state, tickers_map, client, scored, eff_min_score)
 
-            # BTC filtresi: sadece çok aşırı zayıflıkta dur (RSI < 35 VEYA 24s < -3%)
+            # BTC filtresi: sadece çok aşırı zayıflıkta dur (RSI < 30 VEYA 24s < -4%)
             btc_rsi  = btc_strength.get("rsi", 50)
-            btc_weak = btc_rsi < 35
+            btc_weak = btc_rsi < 30
             market_paused = (
-                btc_change < -3.0
+                btc_change < -4.0
                 or not circuit_breaker.can_open_position()
                 or btc_weak
             )
             if btc_weak:
                 logger.info("BTC aşırı zayıf — RSI:%.1f, yeni alım kapalı.", btc_rsi)
-            elif btc_change < -3.0:
+            elif btc_change < -4.0:
                 logger.info("BTC sert düşüyor — 24s:%.2f%%, yeni alım kapalı.", btc_change)
 
             open_positions = _count_open_positions(state, balances, tickers_map)

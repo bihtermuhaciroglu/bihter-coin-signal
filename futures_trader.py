@@ -30,14 +30,19 @@ MARGIN_TYPE        = "ISOLATED"   # ISOLATED = risk izole, CROSSED = paylaşıml
 # ─── Yardımcılar ──────────────────────────────────────────────────────────────
 
 def get_futures_balance(client: Client) -> float:
-    """USDT-M Futures cüzdan bakiyesi."""
+    """USDT-M Futures cüzdan bakiyesi. İzin yoksa sessizce 0 döner."""
     try:
         account = client.futures_account_balance()
         for asset in account:
             if asset["asset"] == "USDT":
                 return float(asset["availableBalance"])
+    except BinanceAPIException as e:
+        if e.code in (-2015, -2014, -1003):
+            logger.warning("Futures bakiye sorgulanamadı (izin/key sorunu): %s", e.code)
+        else:
+            logger.error("futures_balance hata: %s", e)
     except Exception as e:
-        logger.error("futures_balance hata: %s", e)
+        logger.warning("futures_balance hata: %s", e)
     return 0.0
 
 
@@ -57,7 +62,7 @@ def get_futures_account_info(client: Client) -> dict:
 
 
 def get_open_futures_positions(client: Client) -> list:
-    """Açık futures pozisyonlarını listeler."""
+    """Açık futures pozisyonlarını listeler. İzin yoksa boş liste döner."""
     try:
         positions = client.futures_position_information()
         open_pos = []
@@ -76,8 +81,14 @@ def get_open_futures_positions(client: Client) -> list:
                     "notional":      abs(float(p.get("notional", 0))),
                 })
         return open_pos
+    except BinanceAPIException as e:
+        if e.code in (-2015, -2014):
+            logger.warning("Futures pozisyon sorgulanamadı (izin sorunu): %s", e.code)
+        else:
+            logger.error("get_open_futures_positions hata: %s", e)
+        return []
     except Exception as e:
-        logger.error("get_open_futures_positions hata: %s", e)
+        logger.warning("get_open_futures_positions hata: %s", e)
         return []
 
 
