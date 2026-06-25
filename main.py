@@ -1930,15 +1930,18 @@ def run_bot() -> None:
             _sync_holdings_to_state(balances, state, tickers_map)
             check_active_signals(state, tickers_map, client, scored, eff_min_score)
 
-            btc_weak = not btc_strength.get("strong", True)
+            # BTC filtresi: sadece çok aşırı zayıflıkta dur (RSI < 35 VEYA 24s < -3%)
+            btc_rsi  = btc_strength.get("rsi", 50)
+            btc_weak = btc_rsi < 35
             market_paused = (
-                btc_change < BTC_PAUSE_THRESHOLD
+                btc_change < -3.0
                 or not circuit_breaker.can_open_position()
                 or btc_weak
             )
             if btc_weak:
-                logger.info("BTC zayıf — EMA trend:%s RSI:%.1f, yeni alım kapalı.",
-                            btc_strength.get("trend_ok"), btc_strength.get("rsi", 0))
+                logger.info("BTC aşırı zayıf — RSI:%.1f, yeni alım kapalı.", btc_rsi)
+            elif btc_change < -3.0:
+                logger.info("BTC sert düşüyor — 24s:%.2f%%, yeni alım kapalı.", btc_change)
 
             open_positions = _count_open_positions(state, balances, tickers_map)
             if open_positions >= MAX_OPEN_POSITIONS:
@@ -2005,6 +2008,7 @@ def run_bot() -> None:
             del tickers_map, candidates, scored, balances, new_signals
             gc.collect()
             logger.info("Tarama tamamlandı. %ds sonraki tarama.", SCAN_INTERVAL)
+            time.sleep(SCAN_INTERVAL)
 
         except BinanceAPIException as exc:
             if exc.status_code in (429, 418):
