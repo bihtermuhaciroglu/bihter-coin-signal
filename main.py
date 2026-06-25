@@ -34,6 +34,15 @@ from trader import (
     analyze_trade_history,
     format_analysis_report,
 )
+from futures_trader import (
+    futures_long,
+    futures_close_long,
+    futures_close_all,
+    get_futures_balance,
+    get_open_futures_positions,
+    get_futures_position,
+    format_futures_position,
+)
 from learner import build_nightly_report, market_intel
 from ai_brain import (
     ask_ai,
@@ -96,6 +105,11 @@ BINANCE_FEE_PCT = 0.001        # tek yön %0.1
 
 BTC_PAUSE_THRESHOLD = -2.0     # BTC bu kadar düşünce yeni sinyal gönderme
 BTC_STRONG_MARKET = 1.5        # BTC bu kadar artınca piyasa sağlıklı
+
+# ─── Futures ayarları ─────────────────────────────────────────────────────────
+FUTURES_ENABLED  = os.getenv("FUTURES_ENABLED", "false").lower() == "true"
+FUTURES_LEVERAGE = int(os.getenv("FUTURES_LEVERAGE", "3"))
+FUTURES_MIN_SCORE = 85          # Futures için daha yüksek skor şartı
 
 MAX_CLOSED_SIGNALS = 50
 MAX_SIGNAL_HISTORY = 100
@@ -1171,13 +1185,25 @@ def start_command_listener(client: Client) -> None:
                 eff = PORTFOLIO_SIZE_USDT or usdt
                 lines = [
                     "💰 BAKİYE",
-                    f"Spot USDT : {usdt:.4f} USDT",
+                    f"Spot USDT  : {usdt:.4f} USDT",
                 ]
+                if FUTURES_ENABLED:
+                    fut_bal = get_futures_balance(client)
+                    lines.append(f"Futures USDT: {fut_bal:.4f} USDT")
+                    open_pos = get_open_futures_positions(client)
+                    if open_pos:
+                        lines.append(f"\nAçık futures pozisyonlar ({len(open_pos)}):")
+                        for p in open_pos:
+                            pnl_sign = "+" if p["unrealized_pnl"] >= 0 else ""
+                            lines.append(
+                                f"  {p['symbol'].replace('USDT','')}  {p['leverage']}x  "
+                                f"PnL: {pnl_sign}{p['unrealized_pnl']:.2f} USDT"
+                            )
                 if PORTFOLIO_SIZE_USDT:
-                    lines.append(f"Pozisyon  : {eff:.2f} USDT (manuel ayar)")
+                    lines.append(f"Pozisyon   : {eff:.2f} USDT (manuel ayar)")
                 assets = [(a, v) for a, v in balances.items() if a != "USDT" and v > 0]
                 if assets:
-                    lines.append("\nDiğer varlıklar:")
+                    lines.append("\nSpot varlıklar:")
                     for asset, qty in assets:
                         lines.append(f"  {asset}: {qty:.6f}")
                 _reply("\n".join(lines))
@@ -1660,8 +1686,42 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
 
     symbol = signal["symbol"]
     amount = signal["amount"]
+    score  = signal.get("score", 0)
+    atr_stop = signal.get("atr_stop_pct", _effective_stop_pct() * 100) / 100
 
-    # Seans kontrolü
+    # ── FUTURES MODU ─────────────────────────────────────────────────────────
+    if FUTURES_ENABLED and score >= FUTURES_MIN_SCORE:
+        fut_balance = get_futures_balance(client)
+        if fut_balance < 5:
+            send_telegram(
+                f"⚠️ Futures bakiyesi yetersiz ({fut_balance:.2f} USDT)\n"
+                f"Binance → Cüzdan → Transfer → Spot → Futures\n"
+                f"Spot işleme geçildi."
+            )
+        else:
+            fut_amount = min(amount, fut_balance * 0.95)
+            result = futures_long(client, symbol, fut_amount, FUTURES_LEVERAGE, atr_stop)
+            if result:
+                state["signals"][symbol]["futures"]      = True
+                state["signals"][symbol]["auto_qty"]     = result["qty"]
+                state["signals"][symbol]["auto_price"]   = result["avg_price"]
+                state["signals"][symbol]["auto_cost"]    = result["margin"]
+                state["signals"][symbol]["futures_stop"] = result["stop_price"]
+                _apply_exit_levels(state["signals"][symbol], result["avg_price"], atr_stop)
+                _record_trade(state, {**result, "cost": result["margin"]}, signal)
+                coin_name = symbol.replace("USDT", "")
+                send_telegram(
+                    f"🚀 FUTURES LONG AÇILDI\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📈 {coin_name}  @ {result['avg_price']:.6f}\n"
+                    f"💵 Margin: {result['margin']:.2f} USDT  |  Kaldıraç: {result['leverage']}x\n"
+                    f"📊 Pozisyon: {result['notional']:.2f} USDT\n"
+                    f"🛑 Stop: {result['stop_price']:.6f}  (-%{atr_stop*100:.1f})\n"
+                    f"⚡ Skor: {score}/100"
+                )
+                return True
+
+    # ── SPOT MODU ─────────────────────────────────────────────────────────────
     sess = get_active_session()
     if sess:
         if not sess.can_trade(amount):
@@ -1673,38 +1733,29 @@ def _auto_execute_signal(client: Client, signal: dict, state: dict) -> bool:
             state["signals"][symbol]["auto_qty"]   = result["qty"]
             state["signals"][symbol]["auto_price"]  = result["avg_price"]
             state["signals"][symbol]["auto_cost"]   = result["cost"]
-            _apply_exit_levels(
-                state["signals"][symbol],
-                result["avg_price"],
-                _effective_stop_pct(),
-            )
+            _apply_exit_levels(state["signals"][symbol], result["avg_price"], _effective_stop_pct())
             _record_trade(state, result, signal)
             send_telegram(
                 f"🤖 OTOMATİK ALIM YAPILDI\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ {symbol.replace('USDT','')}  {result['avg_price']:.6f} fiyatından\n"
-                f"💵 {result['cost']:.2f} USDT harcandı  |  {result['qty']:.6f} adet alındı\n"
-                f"📋 Seans kalan bütçe: {sess.remaining_usdt:.2f} USDT"
+                f"💵 {result['cost']:.2f} USDT  |  {result['qty']:.6f} adet\n"
+                f"📋 Seans kalan: {sess.remaining_usdt:.2f} USDT"
             )
             return True
     else:
-        # Seans yok ama AUTO_TRADE açık — direkt bakiyeden al
         result = market_buy(client, symbol, amount)
         if result:
-            state["signals"][symbol]["auto_qty"]  = result["qty"]
-            state["signals"][symbol]["auto_price"] = result["avg_price"]
-            state["signals"][symbol]["auto_cost"]  = result["cost"]
-            _apply_exit_levels(
-                state["signals"][symbol],
-                result["avg_price"],
-                _effective_stop_pct(),
-            )
+            state["signals"][symbol]["auto_qty"]   = result["qty"]
+            state["signals"][symbol]["auto_price"]  = result["avg_price"]
+            state["signals"][symbol]["auto_cost"]   = result["cost"]
+            _apply_exit_levels(state["signals"][symbol], result["avg_price"], _effective_stop_pct())
             _record_trade(state, result, signal)
             send_telegram(
                 f"🤖 OTOMATİK ALIM YAPILDI\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ {symbol.replace('USDT','')}  {result['avg_price']:.6f} fiyatından\n"
-                f"💵 {result['cost']:.2f} USDT harcandı  |  {result['qty']:.6f} adet alındı"
+                f"💵 {result['cost']:.2f} USDT  |  {result['qty']:.6f} adet"
             )
             return True
     return False
@@ -1729,8 +1780,30 @@ def _auto_execute_sell(client: Client, symbol: str, state: dict, reason: str) ->
         except Exception as exc:
             logger.error("auto_qty senkron hatası %s: %s", symbol, exc)
 
-    if qty <= 0:
+    if qty <= 0 and not sig.get("futures"):
         logger.warning("Satış atlandı — miktar yok: %s", symbol)
+        return
+
+    # Futures pozisyonunu kapat
+    if sig.get("futures"):
+        result_f = futures_close_long(client, symbol)
+        if result_f:
+            pnl_usdt = result_f["pnl_usdt"]
+            for t in reversed(state.get("trades", [])):
+                if t.get("symbol") == symbol and t.get("exit_reason") is None:
+                    t["exit_reason"] = reason
+                    t["pnl_usdt"]    = pnl_usdt
+                    t["exit_price"]  = result_f["exit_price"]
+                    break
+            emoji = "💰" if pnl_usdt >= 0 else "💸"
+            send_telegram(
+                f"🤖 FUTURES LONG KAPATILDI ({reason})\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{symbol.replace('USDT','')}  {result_f['exit_price']:.6f} fiyatından\n"
+                f"{emoji} PnL: {pnl_usdt:+.2f} USDT  ({result_f['pnl_pct']:+.2f}%)"
+            )
+            sig["auto_qty"] = 0
+            sig["futures"]  = False
         return
 
     result = market_sell(client, symbol, qty)
