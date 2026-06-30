@@ -3,10 +3,17 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+# IPv4'e zorla — Contabo IPv6 adresi Binance whitelist'te kabul edilmiyor
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_only(host, port, family=0, stype=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, stype, proto, flags)
+socket.getaddrinfo = _ipv4_only
 
 import requests
 from binance.client import Client
