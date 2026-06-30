@@ -2099,6 +2099,10 @@ def run_bot() -> None:
                 logger.warning("Rate limit, %ds bekleniyor.", wait)
                 send_telegram(f"⚠️ Binance istek limiti — {wait}s bekleniyor...")
                 time.sleep(wait)
+            elif hasattr(exc, 'code') and exc.code == -2015:
+                # IP/izin hatası — sessizce logla, spam yapma
+                logger.warning("Binance -2015 (IP/izin): %s", exc)
+                time.sleep(SCAN_INTERVAL)
             else:
                 logger.exception("Binance API hatası: %s", exc)
                 send_telegram(f"⚠️ {VERSION} Binance hatası:\n{exc}")

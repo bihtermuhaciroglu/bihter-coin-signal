@@ -317,8 +317,11 @@ class MarketIntelligence:
             self.news       = get_news_sentiment()
             self.trending   = get_trending_coins()
             if client:
-                self.funding = get_funding_rates(client, top_n=10)
-                self.funding_rates = {f["symbol"]: f["rate"] for f in self.funding}
+                try:
+                    self.funding = get_funding_rates(client, top_n=10)
+                    self.funding_rates = {f["symbol"]: f["rate"] for f in self.funding}
+                except Exception:
+                    pass  # Futures API erişimi yoksa sessizce geç
             if self.reddit:
                 self.reddit_score = self.reddit.get("score")
             self.last_update = datetime.now(timezone.utc).replace(tzinfo=None)
