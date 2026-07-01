@@ -89,7 +89,7 @@ def _qty_precision(step_size: float) -> int:
 # Market buy / sell
 # ---------------------------------------------------------------------------
 
-def market_buy(client: Client, symbol: str, usdt_amount: float) -> Optional[dict]:
+def market_buy(client, symbol: str, usdt_amount: float) -> Optional[dict]:
     """
     USDT miktarı kadar market alım yapar.
     Başarılıysa {'symbol', 'qty', 'avg_price', 'cost'} döner.
@@ -141,7 +141,7 @@ def market_buy(client: Client, symbol: str, usdt_amount: float) -> Optional[dict
         return None
 
 
-def market_sell(client: Client, symbol: str, qty: float) -> Optional[dict]:
+def market_sell(client, symbol: str, qty: float) -> Optional[dict]:
     """
     Belirli miktarda market satış yapar.
     Başarılıysa {'symbol', 'qty', 'avg_price', 'proceeds'} döner.
@@ -190,7 +190,7 @@ def market_sell(client: Client, symbol: str, qty: float) -> Optional[dict]:
         return None
 
 
-def sell_all_to_usdt(client: Client, balances: dict) -> dict:
+def sell_all_to_usdt(client, balances: dict) -> dict:
     """
     Tüm USDT-dışı varlıkları USDT'ye çevirir.
     {'sold': [...], 'skipped': [...]} döner.
