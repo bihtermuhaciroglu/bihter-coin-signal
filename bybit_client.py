@@ -83,10 +83,13 @@ class BybitClient:
                 sym = t.get("symbol", "")
                 if not sym.endswith("USDT"):
                     continue
+                # Bybit price24hPcnt ondalık (0.012 = %1.2), Binance yüzde verir
+                pct_raw = float(t.get("price24hPcnt", "0") or "0")
+                pct = pct_raw * 100 if abs(pct_raw) <= 1.0 else pct_raw
                 result.append({
                     "symbol":             sym,
                     "lastPrice":          t.get("lastPrice", "0"),
-                    "priceChangePercent": t.get("price24hPcnt", "0"),
+                    "priceChangePercent": str(round(pct, 4)),
                     "quoteVolume":        t.get("turnover24h", "0"),
                     "volume":             t.get("volume24h", "0"),
                     "highPrice":          t.get("highPrice24h", "0"),
@@ -143,12 +146,15 @@ class BybitClient:
     def get_account(self) -> dict:
         """Spot bakiyelerini Binance formatında döner."""
         try:
-            r = self._session.get_wallet_balance(accountType="SPOT")
+            r = self._session.get_wallet_balance(accountType="UNIFIED")
             balances = []
             for coin in r["result"]["list"][0].get("coin", []):
+                free = (coin.get("availableToWithdraw")
+                        or coin.get("availableToBorrow")
+                        or coin.get("walletBalance", "0"))
                 balances.append({
                     "asset":  coin["coin"],
-                    "free":   coin.get("availableToWithdraw") or coin.get("free", "0"),
+                    "free":   free,
                     "locked": "0",
                 })
             return {"balances": balances}
@@ -157,15 +163,18 @@ class BybitClient:
             return {"balances": []}
 
     def futures_account_balance(self) -> list:
-        """USDT-M Futures bakiyesi — Bybit Unified/Contract hesabından."""
+        """USDT-M Futures bakiyesi — Bybit Unified hesabından."""
         try:
             r = self._session.get_wallet_balance(accountType="UNIFIED")
             result = []
             for coin in r["result"]["list"][0].get("coin", []):
                 if coin["coin"] == "USDT":
+                    avail = (coin.get("availableToWithdraw")
+                             or coin.get("availableToBorrow")
+                             or coin.get("walletBalance", "0"))
                     result.append({
                         "asset":            "USDT",
-                        "availableBalance": coin.get("availableToWithdraw", "0"),
+                        "availableBalance": avail,
                         "balance":          coin.get("walletBalance", "0"),
                     })
             return result
