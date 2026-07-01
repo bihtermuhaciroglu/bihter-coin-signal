@@ -1,6 +1,6 @@
 """
 trader.py — Otomatik işlem motoru
-- Binance emir gönderme (market buy/sell)
+- Binance VE Bybit emir gönderme (market buy/sell)
 - Lot size / min notional / step size kontrolü
 - Seans yönetimi (bütçe + bitiş saati)
 - İşlem geçmişi ve analiz
@@ -12,8 +12,12 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+try:
+    from binance.client import Client as BinanceClient
+    from binance.exceptions import BinanceAPIException
+except ImportError:
+    BinanceClient = None
+    BinanceAPIException = Exception
 
 logger = logging.getLogger(__name__)
 
@@ -24,25 +28,44 @@ logger = logging.getLogger(__name__)
 _symbol_info_cache: dict = {}
 
 
-def get_symbol_rules(client: Client, symbol: str) -> Optional[dict]:
+def _is_bybit(client) -> bool:
+    return type(client).__name__ == "BybitClient"
+
+
+def get_symbol_rules(client, symbol: str) -> Optional[dict]:
     """LOT_SIZE ve MIN_NOTIONAL filtrelerini döner, cache'ler."""
     if symbol in _symbol_info_cache:
         return _symbol_info_cache[symbol]
     try:
-        info = client.get_symbol_info(symbol)
-        if not info:
-            return None
-        rules = {"min_qty": 0.0, "step_size": 0.0, "min_notional": 10.0}
-        for f in info.get("filters", []):
-            if f["filterType"] == "LOT_SIZE":
-                rules["min_qty"]    = float(f["minQty"])
-                rules["step_size"]  = float(f["stepSize"])
-            elif f["filterType"] == "NOTIONAL":
-                rules["min_notional"] = float(f.get("minNotional", 10))
-            elif f["filterType"] == "MIN_NOTIONAL":
-                rules["min_notional"] = float(f.get("minNotional", 10))
-        _symbol_info_cache[symbol] = rules
-        return rules
+        if _is_bybit(client):
+            info = client.get_exchange_info()
+            for s in info.get("symbols", []):
+                if s["symbol"] == symbol:
+                    rules = {"min_qty": 0.00001, "step_size": 0.00001, "min_notional": 1.0}
+                    for f in s.get("filters", []):
+                        if f["filterType"] == "LOT_SIZE":
+                            rules["min_qty"]   = float(f.get("minQty", 0.00001))
+                            rules["step_size"] = float(f.get("stepSize", 0.00001))
+                        elif f["filterType"] == "MIN_NOTIONAL":
+                            rules["min_notional"] = float(f.get("minNotional", 1.0))
+                    _symbol_info_cache[symbol] = rules
+                    return rules
+            return {"min_qty": 0.00001, "step_size": 0.00001, "min_notional": 1.0}
+        else:
+            info = client.get_symbol_info(symbol)
+            if not info:
+                return None
+            rules = {"min_qty": 0.0, "step_size": 0.0, "min_notional": 10.0}
+            for f in info.get("filters", []):
+                if f["filterType"] == "LOT_SIZE":
+                    rules["min_qty"]    = float(f["minQty"])
+                    rules["step_size"]  = float(f["stepSize"])
+                elif f["filterType"] == "NOTIONAL":
+                    rules["min_notional"] = float(f.get("minNotional", 10))
+                elif f["filterType"] == "MIN_NOTIONAL":
+                    rules["min_notional"] = float(f.get("minNotional", 10))
+            _symbol_info_cache[symbol] = rules
+            return rules
     except Exception as exc:
         logger.error("get_symbol_rules %s: %s", symbol, exc)
         return None
@@ -86,10 +109,19 @@ def market_buy(client: Client, symbol: str, usdt_amount: float) -> Optional[dict
             symbol=symbol,
             quoteOrderQty=round(usdt_amount, 2),
         )
+        # Binance fills listesi döner, Bybit farklı format
         fills = order.get("fills", [])
-        total_qty  = sum(float(f["qty"]) for f in fills)
-        total_cost = sum(float(f["qty"]) * float(f["price"]) for f in fills)
-        avg_price  = total_cost / total_qty if total_qty else 0
+        if fills:
+            total_qty  = sum(float(f["qty"]) for f in fills)
+            total_cost = sum(float(f["qty"]) * float(f["price"]) for f in fills)
+            avg_price  = total_cost / total_qty if total_qty else 0
+        else:
+            # Bybit — anlık fiyattan tahmin et
+            avg_price  = float(order.get("avgPrice") or order.get("price") or 0)
+            total_qty  = float(order.get("cumExecQty") or order.get("qty") or 0)
+            total_cost = float(order.get("cumExecValue") or (total_qty * avg_price))
+            if avg_price == 0 and total_cost > 0 and total_qty > 0:
+                avg_price = total_cost / total_qty
 
         result = {
             "symbol":    symbol,
@@ -104,9 +136,6 @@ def market_buy(client: Client, symbol: str, usdt_amount: float) -> Optional[dict
                     symbol, total_qty, avg_price, total_cost)
         return result
 
-    except BinanceAPIException as exc:
-        logger.error("market_buy BinanceAPIException %s: %s", symbol, exc)
-        return None
     except Exception as exc:
         logger.error("market_buy hata %s: %s", symbol, exc)
         return None
@@ -134,9 +163,14 @@ def market_sell(client: Client, symbol: str, qty: float) -> Optional[dict]:
             quantity=f"{qty_rounded:.{precision}f}",
         )
         fills    = order.get("fills", [])
-        total_qty = sum(float(f["qty"]) for f in fills)
-        total_rev = sum(float(f["qty"]) * float(f["price"]) for f in fills)
-        avg_price = total_rev / total_qty if total_qty else 0
+        if fills:
+            total_qty = sum(float(f["qty"]) for f in fills)
+            total_rev = sum(float(f["qty"]) * float(f["price"]) for f in fills)
+            avg_price = total_rev / total_qty if total_qty else 0
+        else:
+            avg_price = float(order.get("avgPrice") or order.get("price") or 0)
+            total_qty = float(order.get("cumExecQty") or order.get("qty") or qty_rounded)
+            total_rev = float(order.get("cumExecValue") or (total_qty * avg_price))
 
         result = {
             "symbol":    symbol,
@@ -151,9 +185,6 @@ def market_sell(client: Client, symbol: str, qty: float) -> Optional[dict]:
                     symbol, total_qty, avg_price, total_rev)
         return result
 
-    except BinanceAPIException as exc:
-        logger.error("market_sell BinanceAPIException %s: %s", symbol, exc)
-        return None
     except Exception as exc:
         logger.error("market_sell hata %s: %s", symbol, exc)
         return None

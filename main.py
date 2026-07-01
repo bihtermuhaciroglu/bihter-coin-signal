@@ -16,9 +16,21 @@ def _ipv4_only(host, port, family=0, stype=0, proto=0, flags=0):
 socket.getaddrinfo = _ipv4_only
 
 import requests
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
+
+load_dotenv()
+_EXCHANGE = os.getenv("EXCHANGE", "binance").lower()
+
+if _EXCHANGE == "bybit":
+    from bybit_client import BybitClient as Client
+    class BinanceAPIException(Exception):
+        def __init__(self, *a, **kw):
+            super().__init__(*a)
+            self.status_code = kw.get("status_code", 0)
+            self.code        = kw.get("code", 0)
+else:
+    from binance.client import Client
+    from binance.exceptions import BinanceAPIException
 
 from indicators import (
     analyze_candidates,
@@ -61,8 +73,6 @@ from ai_brain import (
     volatility_position_multiplier,
     compute_atr_ratio,
 )
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1895,7 +1905,14 @@ def _run_nightly_learning(client: Client, state: dict) -> None:
 
 
 def run_bot() -> None:
-    client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
+    if _EXCHANGE == "bybit":
+        BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY", "")
+        BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+        client = Client(BYBIT_API_KEY, BYBIT_API_SECRET)
+        logger.info("Bybit client oluşturuldu.")
+    else:
+        client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
+        logger.info("Binance client oluşturuldu.")
     auto_label = "🤖 OTOMATİK İŞLEM AÇIK" if AUTO_TRADE_ENABLED else "📢 Sinyal modu (işlem yok)"
     send_telegram(
         f"✅ Bihter Coin Signal {VERSION} başladı.\n"
